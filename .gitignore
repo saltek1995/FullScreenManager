@@ -1,0 +1,10 @@
+.dotnet/
+dist/
+**/bin/
+**/obj/
+*.user
+.claude/
+.repowise/
+.vscode/
+.mcp.json
+.publish-temp/

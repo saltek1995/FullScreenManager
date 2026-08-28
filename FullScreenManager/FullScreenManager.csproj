@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationIcon>Assets\FullScreenManager.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>FullScreenManager</AssemblyName>
+    <RootNamespace>FullScreenManager</RootNamespace>
+    <Product>FullScreenManager</Product>
+    <Description>macOS-style fullscreen virtual desktops for Windows</Description>
+    <Company>FullScreenManager</Company>
+    <Version>1.0.35</Version>
+  </PropertyGroup>
+</Project>
