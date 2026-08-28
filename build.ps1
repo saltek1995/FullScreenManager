@@ -9,11 +9,9 @@ $dotnet = if (Test-Path -LiteralPath $localDotnet) { $localDotnet } else { 'dotn
 & $dotnet publish $project `
     --configuration Release `
     --runtime win-x64 `
-    --self-contained true `
+    --self-contained false `
     --output $output `
     -p:PublishSingleFile=true `
-    -p:EnableCompressionInSingleFile=true `
-    -p:IncludeNativeLibrariesForSelfExtract=true `
     -p:DebugType=None `
     -p:DebugSymbols=false
 

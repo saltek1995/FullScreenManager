@@ -659,11 +659,11 @@ internal sealed class ManagerContext : ApplicationContext
             NativeMethods.GetWindowThreadProcessId(hwnd, out var processId);
             if (processId == (uint)Environment.ProcessId) return true;
 
-            // A managed Space belongs to one fullscreen window. Keep only its
-            // owned dialogs; independent normal windows go back to the origin,
-            // even when the application happens to use the same process.
-            var isOwnedDialog = processId == session.ProcessId && IsOwnedBy(hwnd, session.Hwnd);
-            if (!IsFullscreen(hwnd) && !isOwnedDialog)
+            // Keep auxiliary windows from the same application in its Space.
+            // Browser extensions and similar popups are often ownerless top-level
+            // windows, sometimes even hosted by another process of the same EXE.
+            var belongsToApplication = BelongsToApplication(hwnd, session);
+            if (!IsFullscreen(hwnd) && !belongsToApplication)
             {
                 try
                 {
