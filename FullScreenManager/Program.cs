@@ -8,54 +8,54 @@ internal static class Program
     private static int Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-
-        if (args.Length == 3 && args[0].Equals("--remove-desktop", StringComparison.OrdinalIgnoreCase))
-        {
-            try
-            {
-                new DesktopService().RemoveById(Guid.Parse(args[1]), Guid.Parse(args[2]));
-                return 0;
-            }
-            catch (Exception ex)
-            {
-                try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "FullScreenManager-remove.log"), ex.ToString()); }
-                catch { }
-                return 3;
-            }
-        }
-
-        if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase))
-        {
-            try
-            {
-                var hwndIndex = Array.FindIndex(args, value =>
-                    value.Equals("--hwnd", StringComparison.OrdinalIgnoreCase));
-                var hwnd = hwndIndex >= 0 && hwndIndex + 1 < args.Length
-                    ? new IntPtr(long.Parse(args[hwndIndex + 1]))
-                    : IntPtr.Zero;
-                DesktopService.RunSelfTest(hwnd);
-                return 0;
-            }
-            catch (Exception ex)
-            {
-                try
-                {
-                    File.WriteAllText(Path.Combine(Path.GetTempPath(), "FullScreenManager-selftest.log"), ex.ToString());
-                }
-                catch { }
-                return 2;
-            }
-        }
+        if (IsRemoveCommand(args)) return RemoveDesktop(args);
+        if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase)) return RunSelfTest(args);
 
         using var mutex = new Mutex(true, "Local\\FullScreenManager.Singleton", out var firstInstance);
-        if (!firstInstance)
-        {
-            MessageBox.Show("FullScreenManager уже запущен.", "FullScreenManager",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return 1;
-        }
-
+        if (!firstInstance) return ReportExistingInstance();
         Application.Run(new ManagerContext());
         return 0;
+    }
+
+    private static bool IsRemoveCommand(string[] args) =>
+        args.Length == 3 && args[0].Equals("--remove-desktop", StringComparison.OrdinalIgnoreCase);
+
+    private static int RemoveDesktop(string[] args)
+    {
+        try
+        {
+            new DesktopService().RemoveById(Guid.Parse(args[1]), Guid.Parse(args[2]));
+            return 0;
+        }
+        catch (Exception ex) { WriteFailure("FullScreenManager-remove.log", ex); return 3; }
+    }
+
+    private static int RunSelfTest(string[] args)
+    {
+        try
+        {
+            DesktopService.RunSelfTest(ParseWindowHandle(args));
+            return 0;
+        }
+        catch (Exception ex) { WriteFailure("FullScreenManager-selftest.log", ex); return 2; }
+    }
+
+    private static IntPtr ParseWindowHandle(string[] args)
+    {
+        var index = Array.FindIndex(args, value => value.Equals("--hwnd", StringComparison.OrdinalIgnoreCase));
+        return index >= 0 && index + 1 < args.Length ? new IntPtr(long.Parse(args[index + 1])) : IntPtr.Zero;
+    }
+
+    private static void WriteFailure(string fileName, Exception exception)
+    {
+        try { File.WriteAllText(Path.Combine(Path.GetTempPath(), fileName), exception.ToString()); }
+        catch (Exception logError) { AppLogger.Error("Не удалось записать аварийный журнал", logError); }
+    }
+
+    private static int ReportExistingInstance()
+    {
+        MessageBox.Show("FullScreenManager уже запущен.", "FullScreenManager",
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
+        return 1;
     }
 }

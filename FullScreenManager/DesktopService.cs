@@ -155,31 +155,32 @@ internal sealed class DesktopService
         } : null;
         ownedWindow?.Show();
         var hwnd = externalWindow != IntPtr.Zero ? externalWindow : ownedWindow!.Handle;
-        try
-        {
-            created = service.Create();
-            service.MoveAfterPrimary(created);
-            if (service.GetAll().ElementAtOrDefault(1)?.Id != created.Id)
-                throw new InvalidOperationException("Не удалось поместить тестовый Space после главного стола.");
-            service.SetName(created, "FullScreenManager Test");
-            if (service.GetName(created) != "FullScreenManager Test")
-                throw new InvalidOperationException(
-                    $"Windows сохранила неверное имя рабочего стола: '{service.GetName(created)}'.");
-            var found = service.Find(created.Id)
-                ?? throw new InvalidOperationException("Созданный стол не найден в системной коллекции.");
-            service.SetName(found, "FullScreenManager Found Test");
-            service.MoveWindow(hwnd, created);
-            service.MoveWindow(hwnd, origin);
-            service.Remove(created, origin);
-            created = null;
-        }
-        finally
-        {
-            if (created is not null)
-            {
-                try { service.Remove(created, origin); } catch { }
-            }
-        }
+        created = service.Create();
+        try { ExecuteSelfTest(service, created, origin, hwnd); created = null; }
+        finally { RemoveTestDesktop(service, created, origin); }
+    }
+
+    private static void ExecuteSelfTest(DesktopService service, Desktop created, Desktop origin, IntPtr hwnd)
+    {
+        service.MoveAfterPrimary(created);
+        if (service.GetAll().ElementAtOrDefault(1)?.Id != created.Id)
+            throw new InvalidOperationException("Не удалось поместить тестовый Space после главного стола.");
+        service.SetName(created, "FullScreenManager Test");
+        if (service.GetName(created) != "FullScreenManager Test")
+            throw new InvalidOperationException($"Windows сохранила неверное имя рабочего стола: '{service.GetName(created)}'.");
+        var found = service.Find(created.Id)
+            ?? throw new InvalidOperationException("Созданный стол не найден в системной коллекции.");
+        service.SetName(found, "FullScreenManager Found Test");
+        service.MoveWindow(hwnd, created);
+        service.MoveWindow(hwnd, origin);
+        service.Remove(created, origin);
+    }
+
+    private static void RemoveTestDesktop(DesktopService service, Desktop? created, Desktop origin)
+    {
+        if (created is null) return;
+        try { service.Remove(created, origin); }
+        catch (Exception ex) { AppLogger.Error("Не удалось удалить тестовый Space", ex); }
     }
 
     internal sealed class Desktop
