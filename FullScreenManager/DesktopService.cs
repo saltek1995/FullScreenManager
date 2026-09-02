@@ -77,19 +77,12 @@ internal sealed class DesktopService
     public void SetName(Desktop desktop, string name)
     {
         Marshal.ThrowExceptionForHR(WindowsCreateString(name, name.Length, out var hstring));
-        var managerPointer = Marshal.GetComInterfaceForObject(_internal, typeof(IVirtualDesktopManagerInternal));
-        var desktopPointer = Marshal.GetComInterfaceForObject(desktop.Value, typeof(IVirtualDesktop));
         try
         {
-            var vtable = Marshal.ReadIntPtr(managerPointer);
-            var method = Marshal.ReadIntPtr(vtable, 16 * IntPtr.Size);
-            var setName = Marshal.GetDelegateForFunctionPointer<SetDesktopNameNative>(method);
-            Marshal.ThrowExceptionForHR(setName(managerPointer, desktopPointer, hstring));
+            Marshal.ThrowExceptionForHR(_internal.SetDesktopName(desktop.Value, hstring));
         }
         finally
         {
-            Marshal.Release(desktopPointer);
-            Marshal.Release(managerPointer);
             WindowsDeleteString(hstring);
         }
     }
@@ -135,9 +128,6 @@ internal sealed class DesktopService
 
     [DllImport("combase.dll")]
     private static extern int WindowsDeleteString(IntPtr hstring);
-
-    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-    private delegate int SetDesktopNameNative(IntPtr instance, IntPtr desktop, IntPtr name);
 
     public static void RunSelfTest(IntPtr externalWindow)
     {
@@ -219,7 +209,7 @@ internal interface IVirtualDesktopManagerInternal
     void RemoveDesktop(IVirtualDesktop desktop, IVirtualDesktop fallback);
     IVirtualDesktop FindDesktop(ref Guid desktopId);
     void GetDesktopSwitchIncludeExcludeViews(IVirtualDesktop desktop, out IntPtr include, out IntPtr exclude);
-    void SetDesktopName(IVirtualDesktop desktop, [MarshalAs(UnmanagedType.HString)] string name);
+    [PreserveSig] int SetDesktopName(IVirtualDesktop desktop, IntPtr name);
 }
 
 [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]

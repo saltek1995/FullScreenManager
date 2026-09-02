@@ -349,7 +349,8 @@ internal sealed class ManagerContext : ApplicationContext
             var desktopName = GetApplicationName(hwnd);
             NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
             managed = CreateSession(hwnd, pid, origin, dedicated, desktopName);
-            try { _desktops.SetName(dedicated, desktopName); } catch { }
+            try { _desktops.SetName(dedicated, desktopName); }
+            catch (Exception ex) { AppLogger.Error($"Не удалось назвать Space {dedicated.Id}", ex); }
             _desktops.MoveWindow(hwnd, dedicated);
             managed.State = SessionState.Active;
             SaveSessions();
