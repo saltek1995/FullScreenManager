@@ -12,6 +12,6 @@
     <Product>FullScreenManager</Product>
     <Description>macOS-style fullscreen virtual desktops for Windows</Description>
     <Company>FullScreenManager</Company>
-    <Version>1.0.39</Version>
+    <Version>1.0.40</Version>
   </PropertyGroup>
 </Project>

@@ -9,6 +9,7 @@ internal static class Program
     {
         ApplicationConfiguration.Initialize();
         if (IsRemoveCommand(args)) return RemoveDesktop(args);
+        if (args.Contains("--self-test-ui", StringComparer.OrdinalIgnoreCase)) return RunUiSelfTest();
         if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase)) return RunSelfTest(args);
 
         using var mutex = new Mutex(true, "Local\\FullScreenManager.Singleton", out var firstInstance);
@@ -19,6 +20,12 @@ internal static class Program
 
     private static bool IsRemoveCommand(string[] args) =>
         args.Length == 3 && args[0].Equals("--remove-desktop", StringComparison.OrdinalIgnoreCase);
+
+    private static int RunUiSelfTest()
+    {
+        try { AboutDialog.RunLayoutSelfTest(); return 0; }
+        catch (Exception ex) { WriteFailure("FullScreenManager-ui-selftest.log", ex); return 4; }
+    }
 
     private static int RemoveDesktop(string[] args)
     {
