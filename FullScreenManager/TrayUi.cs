@@ -1,5 +1,3 @@
-using System.Diagnostics;
-
 namespace FullScreenManager;
 
 internal static class TrayUi
@@ -13,10 +11,14 @@ internal static class TrayUi
         };
         autostartItem.Click += (_, _) => SetAutostart(autostartItem, !autostartItem.Checked);
 
-        var menu = new ContextMenuStrip();
+        var menu = new ContextMenuStrip
+        {
+            ShowImageMargin = false,
+            ShowCheckMargin = true,
+            Padding = new Padding(2)
+        };
         menu.Items.Add(enabledItem);
         menu.Items.Add(autostartItem);
-        menu.Items.Add("Настроить окна всех рабочих столов…", null, (_, _) => OpenSettings());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("О программе", null, (_, _) => ShowAbout());
         menu.Items.Add("Выход", null, (_, _) => exit());
@@ -45,17 +47,9 @@ internal static class TrayUi
         }
     }
 
-    private static void OpenSettings()
+    private static void ShowAbout()
     {
-        try { Process.Start(new ProcessStartInfo("ms-settings:multitasking") { UseShellExecute = true }); }
-        catch (Exception ex)
-        {
-            MessageBox.Show($"Не удалось открыть настройки Windows:\n{ex.Message}",
-                "FullScreenManager", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
+        using var dialog = new AboutDialog();
+        dialog.ShowDialog();
     }
-
-    private static void ShowAbout() => MessageBox.Show(
-        "FullScreenManager 1.0\n\nМаксимизированные окна на отдельных виртуальных рабочих столах.",
-        "О программе", MessageBoxButtons.OK, MessageBoxIcon.Information);
 }

@@ -52,7 +52,7 @@ internal static class WindowInspector
     {
         if (NativeMethods.IsIconic(hwnd)) return false;
         if (NativeMethods.IsZoomed(hwnd)) return true;
-        if (!NativeMethods.GetWindowRect(hwnd, out var window)) return false;
+        if (!TryGetWindowBounds(hwnd, out var window)) return false;
         var monitor = NativeMethods.MonitorFromWindow(hwnd, 2);
         if (monitor == IntPtr.Zero) return false;
         var info = new NativeMethods.MonitorInfo { Size = Marshal.SizeOf<NativeMethods.MonitorInfo>() };
@@ -88,7 +88,7 @@ internal static class WindowInspector
         if (IsShellWindow(ReadWindowText(hwnd).Trim())) return false;
 
         NativeMethods.DwmGetWindowAttribute(hwnd, NativeMethods.DwmwaCloaked,
-            out var cloaked, Marshal.SizeOf<int>());
+            out int cloaked, Marshal.SizeOf<int>());
         if (cloaked != 0 && !IsFullscreen(hwnd)) return false;
         NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
         return pid != (uint)Environment.ProcessId;
@@ -134,6 +134,16 @@ internal static class WindowInspector
         "Virtual desktop switching preview" or "Desktop switching preview";
 
     private static bool IsClose(int first, int second, int tolerance) => Math.Abs(first - second) <= tolerance;
+
+    private static bool TryGetWindowBounds(IntPtr hwnd, out NativeMethods.Rect bounds)
+    {
+        // DWM bounds use physical screen coordinates and avoid GetWindowRect's
+        // DPI virtualization. Exclusive mode can disable DWM, so retain the
+        // User32 call as a required fallback.
+        var result = NativeMethods.DwmGetWindowAttribute(hwnd, NativeMethods.DwmwaExtendedFrameBounds,
+            out bounds, Marshal.SizeOf<NativeMethods.Rect>());
+        return result == 0 || NativeMethods.GetPhysicalWindowRect(hwnd, out bounds);
+    }
 
     private static string SanitizeDesktopName(string value)
     {

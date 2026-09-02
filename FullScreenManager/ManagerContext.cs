@@ -7,6 +7,8 @@ namespace FullScreenManager;
 
 internal sealed class ManagerContext : ApplicationContext
 {
+    private static readonly TimeSpan DisplayModeTransitionGrace = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan FullscreenExitConfirmation = TimeSpan.FromSeconds(1);
     private readonly Timer _timer = new() { Interval = 100 };
     private DesktopService _desktops = new();
     private readonly Dictionary<IntPtr, bool> _previous = [];
@@ -179,11 +181,26 @@ internal sealed class ManagerContext : ApplicationContext
 
         WindowMover.Reconcile(_desktops, session);
         UpdateDesktopName(hwnd, session);
+        var isCurrent = _desktops.IsCurrent(session.Dedicated);
+        var isForeground = hwnd == NativeMethods.GetForegroundWindow();
+        var wasCurrent = session.WasOnDedicatedDesktop;
+        var wasForeground = session.WasForeground;
+        session.WasOnDedicatedDesktop = isCurrent;
+        session.WasForeground = isForeground;
+        if ((isCurrent && !wasCurrent) || (isForeground && !wasForeground))
+            BeginDisplayModeTransition(session);
+
         if (NativeMethods.IsIconic(hwnd))
         {
-            // Windows minimizes exclusive-fullscreen games when their Space
-            // loses focus; only a minimize on the current Space is deliberate.
-            if (_desktops.IsCurrent(session.Dedicated))
+            // A deliberate minimize starts while the game is foreground on its
+            // current Space. Minimize/restore caused by an exclusive mode switch
+            // must not remove the dedicated desktop.
+            if (IsDisplayModeTransitionActive(session) && isCurrent)
+            {
+                NativeMethods.ShowWindowAsync(hwnd, 9); // SW_RESTORE
+                NativeMethods.SetForegroundWindow(hwnd);
+            }
+            else if (isCurrent && wasCurrent && wasForeground)
             {
                 AppLogger.Info($"Сессия {session.DedicatedDesktopId}: окно свёрнуто");
                 ReturnWindow(hwnd, session, true);
@@ -191,20 +208,19 @@ internal sealed class ManagerContext : ApplicationContext
             return;
         }
 
-        MonitorFullscreenState(hwnd, session);
+        MonitorFullscreenState(hwnd, session, isCurrent, isForeground);
     }
 
-    private void MonitorFullscreenState(IntPtr hwnd, ManagedSession session)
+    private void MonitorFullscreenState(IntPtr hwnd, ManagedSession session, bool isCurrent, bool isForeground)
     {
-        if (IsFullscreen(hwnd) || hwnd != NativeMethods.GetForegroundWindow() ||
-            session.Dedicated is null || !_desktops.IsCurrent(session.Dedicated))
+        if (IsFullscreen(hwnd) || !isForeground || !isCurrent || IsDisplayModeTransitionActive(session))
         {
             session.FullscreenLostSince = null;
             return;
         }
 
         session.FullscreenLostSince ??= DateTime.UtcNow;
-        if (DateTime.UtcNow - session.FullscreenLostSince.Value < TimeSpan.FromMilliseconds(300)) return;
+        if (DateTime.UtcNow - session.FullscreenLostSince.Value < FullscreenExitConfirmation) return;
         AppLogger.Info($"Сессия {session.DedicatedDesktopId}: подтверждён выход из полноэкранного режима");
         ReturnWindow(hwnd, session, false);
     }
@@ -214,14 +230,21 @@ internal sealed class ManagerContext : ApplicationContext
         var replacement = FindReplacementWindow(session);
         if (replacement == IntPtr.Zero)
         {
+            session.MissingSince ??= DateTime.UtcNow;
+            if (IsDisplayModeTransitionActive(session) ||
+                DateTime.UtcNow - session.MissingSince.Value < DisplayModeTransitionGrace) return;
             AppLogger.Info($"Сессия {session.DedicatedDesktopId}: окно закрыто");
             CleanupSession(hwnd, session, false);
             return;
         }
 
+        session.MissingSince = null;
         _sessions.Remove(hwnd);
         session.WindowHandle = replacement.ToInt64();
         session.UpdatedUtc = DateTime.UtcNow;
+        session.WasForeground = false;
+        session.WasOnDedicatedDesktop = false;
+        BeginDisplayModeTransition(session);
         _sessions[replacement] = session;
         _previous[replacement] = IsFullscreen(replacement);
         UpdateDesktopName(replacement, session);
@@ -230,15 +253,20 @@ internal sealed class ManagerContext : ApplicationContext
 
     private IntPtr FindReplacementWindow(ManagedSession session)
     {
-        var matches = new List<IntPtr>();
+        var fullscreenMatches = new List<IntPtr>();
+        var visibleMatches = new List<IntPtr>();
         NativeMethods.EnumWindows((hwnd, _) =>
         {
             NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
-            if (pid == session.ProcessId && NativeMethods.IsWindowVisible(hwnd) && IsFullscreen(hwnd))
-                matches.Add(hwnd);
+            if (pid != session.ProcessId || !NativeMethods.IsWindowVisible(hwnd)) return true;
+            visibleMatches.Add(hwnd);
+            if (IsFullscreen(hwnd)) fullscreenMatches.Add(hwnd);
             return true;
         }, IntPtr.Zero);
-        return matches.Count == 1 ? matches[0] : IntPtr.Zero;
+        if (fullscreenMatches.Count == 1) return fullscreenMatches[0];
+        return IsDisplayModeTransitionActive(session) && visibleMatches.Count == 1
+            ? visibleMatches[0]
+            : IntPtr.Zero;
     }
 
     private void ProcessStartupWindows()
@@ -247,6 +275,7 @@ internal sealed class ManagerContext : ApplicationContext
         _timer.Stop();
         var foreground = NativeMethods.GetForegroundWindow();
         DesktopService.Desktop? desktopToShow = null;
+        var windowToShow = IntPtr.Zero;
 
         try
         {
@@ -256,10 +285,17 @@ internal sealed class ManagerContext : ApplicationContext
                 if (!NativeMethods.IsWindow(startup.Handle) || !IsFullscreen(startup.Handle)) continue;
                 var created = ProcessStartupWindow(startup);
                 if (created is not null && (startup.Handle == foreground || desktopToShow is null))
+                {
                     desktopToShow = created;
+                    windowToShow = startup.Handle;
+                }
             }
 
-            if (desktopToShow is not null) _desktops.Switch(desktopToShow);
+            if (desktopToShow is not null)
+            {
+                _desktops.Switch(desktopToShow);
+                if (_sessions.TryGetValue(windowToShow, out var session)) ActivateFullscreenWindow(windowToShow, session);
+            }
         }
         finally
         {
@@ -321,7 +357,7 @@ internal sealed class ManagerContext : ApplicationContext
             managed.State = SessionState.Active;
             SaveSessions();
             _desktops.Switch(dedicated);
-            NativeMethods.SetForegroundWindow(hwnd);
+            ActivateFullscreenWindow(hwnd, managed);
         }
         catch (Exception ex)
         {
@@ -415,6 +451,7 @@ internal sealed class ManagerContext : ApplicationContext
             CreatedUtc = DateTime.UtcNow,
             UpdatedUtc = DateTime.UtcNow
         };
+        BeginDisplayModeTransition(session);
         _sessions[hwnd] = session;
         _desktopStore.Track(dedicated.Id, origin.Id);
         SaveSessions();
@@ -425,8 +462,24 @@ internal sealed class ManagerContext : ApplicationContext
     private void RecoverSessions()
     {
         foreach (var session in SessionRecovery.Recover(_desktops, _sessionStore, _desktopStore))
+        {
+            BeginDisplayModeTransition(session);
             _sessions[session.Hwnd] = session;
+        }
         SaveSessions();
+    }
+
+    private static void BeginDisplayModeTransition(ManagedSession session) =>
+        session.ModeTransitionUntilUtc = DateTime.UtcNow + DisplayModeTransitionGrace;
+
+    private static bool IsDisplayModeTransitionActive(ManagedSession session) =>
+        DateTime.UtcNow < session.ModeTransitionUntilUtc;
+
+    private static void ActivateFullscreenWindow(IntPtr hwnd, ManagedSession session)
+    {
+        BeginDisplayModeTransition(session);
+        if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindowAsync(hwnd, 9); // SW_RESTORE
+        NativeMethods.SetForegroundWindow(hwnd);
     }
 
     private void SaveSessions() => _sessionStore.Save(_sessions.Values.Distinct());

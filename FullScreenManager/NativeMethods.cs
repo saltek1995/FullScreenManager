@@ -7,6 +7,7 @@ internal static class NativeMethods
 {
     internal const uint GwOwner = 4;
     internal const int DwmwaCloaked = 14;
+    internal const int DwmwaExtendedFrameBounds = 9;
 
     internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
@@ -32,6 +33,19 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+    internal static bool GetPhysicalWindowRect(IntPtr hwnd, out Rect rect)
+    {
+        var previous = SetThreadDpiAwarenessContext(new IntPtr(-4)); // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        try { return GetWindowRect(hwnd, out rect); }
+        finally
+        {
+            if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous);
+        }
+    }
 
     [DllImport("user32.dll")]
     internal static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
@@ -62,8 +76,15 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool SetForegroundWindow(IntPtr hwnd);
 
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool ShowWindowAsync(IntPtr hwnd, int command);
+
     [DllImport("dwmapi.dll")]
     internal static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);
+
+    [DllImport("dwmapi.dll")]
+    internal static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out Rect value, int size);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct Rect

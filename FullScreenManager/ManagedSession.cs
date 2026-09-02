@@ -32,5 +32,8 @@ internal sealed class ManagedSession
     [JsonIgnore] public DateTime? DesktopMissingSince { get; set; }
     [JsonIgnore] public DateTime? OriginMissingSince { get; set; }
     [JsonIgnore] public DateTime? FullscreenLostSince { get; set; }
+    [JsonIgnore] public DateTime ModeTransitionUntilUtc { get; set; }
+    [JsonIgnore] public bool WasOnDedicatedDesktop { get; set; }
+    [JsonIgnore] public bool WasForeground { get; set; }
     [JsonIgnore] public IntPtr Hwnd => new(WindowHandle);
 }
