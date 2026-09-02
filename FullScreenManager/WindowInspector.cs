@@ -92,6 +92,10 @@ internal static class WindowInspector
     internal static bool IsCandidate(IntPtr hwnd)
     {
         if (!NativeMethods.IsWindowVisible(hwnd) || NativeMethods.GetWindowTextLength(hwnd) == 0) return false;
+        const long toolWindow = 0x00000080;
+        const long noActivate = 0x08000000;
+        var extendedStyle = NativeMethods.GetWindowLongPtr(hwnd, NativeMethods.GwlExStyle).ToInt64();
+        if ((extendedStyle & (toolWindow | noActivate)) != 0) return false;
         var className = ReadClassName(hwnd);
         if (className is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd") return false;
         if (IsShellWindow(ReadWindowText(hwnd).Trim())) return false;
@@ -140,7 +144,9 @@ internal static class WindowInspector
 
     private static bool IsShellWindow(string title) => title is
         "Переключение задач" or "Представление задач" or "Task Switching" or "Task View" or
-        "Virtual desktop switching preview" or "Desktop switching preview";
+        "Virtual desktop switching preview" or "Desktop switching preview" or
+        "Наложение Ножниц" or "Snipping Tool overlay" or "Screen snipping" or
+        "Интерфейс ввода Windows" or "Windows Input Experience";
 
     private static bool IsClose(int first, int second, int tolerance) => Math.Abs(first - second) <= tolerance;
 

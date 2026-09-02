@@ -16,7 +16,7 @@ $dotnet = if (Test-Path -LiteralPath $localDotnet) { $localDotnet } else { 'dotn
     -p:DebugSymbols=false
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Сборка завершилась с кодом $LASTEXITCODE. Закройте запущенный FullScreenManager.exe и повторите попытку."
+    throw "Build failed with exit code $LASTEXITCODE. Close FullScreenManager.exe and retry."
 }
 
-Write-Host "Готово: $(Join-Path $output 'FullScreenManager.exe')"
+Write-Host "Ready: $(Join-Path $output 'FullScreenManager.exe')"

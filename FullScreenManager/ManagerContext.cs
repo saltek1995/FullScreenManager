@@ -194,8 +194,10 @@ internal sealed class ManagerContext : ApplicationContext
             // must not remove the dedicated desktop.
             if (session.AwaitingFullscreenReactivation && isCurrent)
             {
-                NativeMethods.ShowWindowAsync(hwnd, 9); // SW_RESTORE
-                NativeMethods.SetForegroundWindow(hwnd);
+                // Activation is requested once when this Space is selected.
+                // Reasserting foreground from the monitor loop makes a foreign
+                // window and the game steal focus from each other every tick.
+                return;
             }
             else if (isCurrent && wasCurrent && wasForeground)
             {
@@ -299,6 +301,7 @@ internal sealed class ManagerContext : ApplicationContext
 
     private DesktopService.Desktop? ProcessStartupWindow(StartupWindow startup)
     {
+        if (IsAlreadyManaged(startup.Handle)) return null;
         DesktopService.Desktop? dedicated = null;
         ManagedSession? managed = null;
         try
@@ -330,6 +333,7 @@ internal sealed class ManagerContext : ApplicationContext
 
     private void SendToNewDesktop(IntPtr hwnd, DesktopService.Desktop? knownOrigin)
     {
+        if (IsAlreadyManaged(hwnd)) return;
         _busy = true;
         _timer.Stop();
         DesktopService.Desktop? dedicated = null;
@@ -430,6 +434,11 @@ internal sealed class ManagerContext : ApplicationContext
     private ManagedSession CreateSession(IntPtr hwnd, uint processId, DesktopService.Desktop origin,
         DesktopService.Desktop dedicated, string name)
     {
+        if (IsAlreadyManaged(hwnd))
+            throw new InvalidOperationException($"HWND {hwnd} уже принадлежит активной сессии.");
+        if (_sessions.Values.Any(existing => existing.DedicatedDesktopId == dedicated.Id))
+            throw new InvalidOperationException($"Space {dedicated.Id} уже принадлежит активной сессии.");
+
         var session = new ManagedSession
         {
             WindowHandle = hwnd.ToInt64(),
@@ -445,7 +454,8 @@ internal sealed class ManagerContext : ApplicationContext
             UpdatedUtc = DateTime.UtcNow
         };
         BeginDisplayModeTransition(session);
-        _sessions[hwnd] = session;
+        if (!_sessions.TryAdd(hwnd, session))
+            throw new InvalidOperationException($"Не удалось зарегистрировать HWND {hwnd}.");
         _desktopStore.Track(dedicated.Id, origin.Id);
         SaveSessions();
         AppLogger.Info($"Создана сессия {dedicated.Id} для HWND {hwnd} ({name})");
@@ -456,8 +466,14 @@ internal sealed class ManagerContext : ApplicationContext
     {
         foreach (var session in SessionRecovery.Recover(_desktops, _sessionStore, _desktopStore))
         {
+            if (IsAlreadyManaged(session.Hwnd) ||
+                _sessions.Values.Any(existing => existing.DedicatedDesktopId == session.DedicatedDesktopId))
+            {
+                AppLogger.Warning($"Пропущена дублирующая восстановленная сессия HWND {session.Hwnd}, Space {session.DedicatedDesktopId}");
+                continue;
+            }
             BeginDisplayModeTransition(session);
-            _sessions[session.Hwnd] = session;
+            _sessions.Add(session.Hwnd, session);
         }
         SaveSessions();
     }
@@ -497,7 +513,9 @@ internal sealed class ManagerContext : ApplicationContext
         foreach (var key in _sessions.Where(pair => ReferenceEquals(pair.Value, session))
                      .Select(pair => pair.Key).ToList())
             _sessions.Remove(key);
-        _previous[session.Hwnd] = false;
+        // Do not immediately rediscover the same still-fullscreen transient
+        // window after its session has just been removed.
+        _previous[session.Hwnd] = NativeMethods.IsWindow(session.Hwnd) && IsFullscreen(session.Hwnd);
         _desktopStore.Forget(session.DedicatedDesktopId);
         SaveSessions();
     }
@@ -559,6 +577,9 @@ internal sealed class ManagerContext : ApplicationContext
             if (zoomed && !_sessions.ContainsKey(hwnd)) _startupWindows.Enqueue(new StartupWindow(hwnd, origin));
         });
     }
+
+    private bool IsAlreadyManaged(IntPtr hwnd) =>
+        _sessions.ContainsKey(hwnd) || _sessions.Values.Any(session => session.Hwnd == hwnd);
 
     private void UpdateDesktopName(IntPtr hwnd, ManagedSession session)
     {

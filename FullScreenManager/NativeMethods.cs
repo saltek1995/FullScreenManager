@@ -9,6 +9,7 @@ internal static class NativeMethods
     internal const int DwmwaCloaked = 14;
     internal const int DwmwaExtendedFrameBounds = 9;
     internal const int GwlStyle = -16;
+    internal const int GwlExStyle = -20;
 
     internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 

@@ -14,13 +14,7 @@ internal static class WindowMover
 
             try
             {
-                var followWindow = hwnd == NativeMethods.GetForegroundWindow();
                 desktops.MoveWindow(hwnd, session.Origin);
-                if (followWindow && desktops.IsCurrent(session.Dedicated))
-                {
-                    desktops.Switch(session.Origin);
-                    NativeMethods.SetForegroundWindow(hwnd);
-                }
             }
             catch (Exception ex) { AppLogger.Warning($"Не удалось вернуть постороннее окно {hwnd}: {ex.Message}"); }
             return true;
