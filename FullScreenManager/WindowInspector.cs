@@ -65,6 +65,15 @@ internal static class WindowInspector
                IsClose(window.Bottom, info.Monitor.Bottom, tolerance);
     }
 
+    internal static bool IsClearlyWindowed(IntPtr hwnd)
+    {
+        if (NativeMethods.IsIconic(hwnd) || NativeMethods.IsZoomed(hwnd) || IsFullscreen(hwnd)) return false;
+        const long windowCaption = 0x00C00000;
+        const long thickFrame = 0x00040000;
+        var style = NativeMethods.GetWindowLongPtr(hwnd, NativeMethods.GwlStyle).ToInt64();
+        return (style & windowCaption) == windowCaption || (style & thickFrame) != 0;
+    }
+
     internal static string GetApplicationName(IntPtr hwnd)
     {
         var windowName = GetWindowName(hwnd);

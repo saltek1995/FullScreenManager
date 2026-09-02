@@ -8,6 +8,7 @@ internal static class NativeMethods
     internal const uint GwOwner = 4;
     internal const int DwmwaCloaked = 14;
     internal const int DwmwaExtendedFrameBounds = 9;
+    internal const int GwlStyle = -16;
 
     internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
@@ -59,6 +60,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     internal static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+    internal static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
 
     [DllImport("user32.dll")]
     internal static extern int GetWindowTextLength(IntPtr hwnd);

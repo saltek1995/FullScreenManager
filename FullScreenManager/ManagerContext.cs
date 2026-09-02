@@ -7,8 +7,6 @@ namespace FullScreenManager;
 
 internal sealed class ManagerContext : ApplicationContext
 {
-    private static readonly TimeSpan DisplayModeTransitionGrace = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan FullscreenExitConfirmation = TimeSpan.FromSeconds(1);
     private readonly Timer _timer = new() { Interval = 100 };
     private DesktopService _desktops = new();
     private readonly Dictionary<IntPtr, bool> _previous = [];
@@ -171,7 +169,6 @@ internal sealed class ManagerContext : ApplicationContext
 
     private void MonitorOwnerWindow(IntPtr hwnd, ManagedSession session)
     {
-        session.MissingSince = null;
         if (!NativeMethods.IsWindowVisible(hwnd) || session.Dedicated is null)
         {
             AppLogger.Info($"Сессия {session.DedicatedDesktopId}: окно скрыто в трей");
@@ -195,7 +192,7 @@ internal sealed class ManagerContext : ApplicationContext
             // A deliberate minimize starts while the game is foreground on its
             // current Space. Minimize/restore caused by an exclusive mode switch
             // must not remove the dedicated desktop.
-            if (IsDisplayModeTransitionActive(session) && isCurrent)
+            if (session.AwaitingFullscreenReactivation && isCurrent)
             {
                 NativeMethods.ShowWindowAsync(hwnd, 9); // SW_RESTORE
                 NativeMethods.SetForegroundWindow(hwnd);
@@ -213,14 +210,13 @@ internal sealed class ManagerContext : ApplicationContext
 
     private void MonitorFullscreenState(IntPtr hwnd, ManagedSession session, bool isCurrent, bool isForeground)
     {
-        if (IsFullscreen(hwnd) || !isForeground || !isCurrent || IsDisplayModeTransitionActive(session))
+        if (IsFullscreen(hwnd))
         {
-            session.FullscreenLostSince = null;
+            session.AwaitingFullscreenReactivation = false;
             return;
         }
-
-        session.FullscreenLostSince ??= DateTime.UtcNow;
-        if (DateTime.UtcNow - session.FullscreenLostSince.Value < FullscreenExitConfirmation) return;
+        if (!isForeground || !isCurrent || session.AwaitingFullscreenReactivation ||
+            !WindowInspector.IsClearlyWindowed(hwnd)) return;
         AppLogger.Info($"Сессия {session.DedicatedDesktopId}: подтверждён выход из полноэкранного режима");
         ReturnWindow(hwnd, session, false);
     }
@@ -230,15 +226,12 @@ internal sealed class ManagerContext : ApplicationContext
         var replacement = FindReplacementWindow(session);
         if (replacement == IntPtr.Zero)
         {
-            session.MissingSince ??= DateTime.UtcNow;
-            if (IsDisplayModeTransitionActive(session) ||
-                DateTime.UtcNow - session.MissingSince.Value < DisplayModeTransitionGrace) return;
+            if (IsProcessAlive(session.ProcessId)) return;
             AppLogger.Info($"Сессия {session.DedicatedDesktopId}: окно закрыто");
             CleanupSession(hwnd, session, false);
             return;
         }
 
-        session.MissingSince = null;
         _sessions.Remove(hwnd);
         session.WindowHandle = replacement.ToInt64();
         session.UpdatedUtc = DateTime.UtcNow;
@@ -264,7 +257,7 @@ internal sealed class ManagerContext : ApplicationContext
             return true;
         }, IntPtr.Zero);
         if (fullscreenMatches.Count == 1) return fullscreenMatches[0];
-        return IsDisplayModeTransitionActive(session) && visibleMatches.Count == 1
+        return session.AwaitingFullscreenReactivation && visibleMatches.Count == 1
             ? visibleMatches[0]
             : IntPtr.Zero;
     }
@@ -470,10 +463,17 @@ internal sealed class ManagerContext : ApplicationContext
     }
 
     private static void BeginDisplayModeTransition(ManagedSession session) =>
-        session.ModeTransitionUntilUtc = DateTime.UtcNow + DisplayModeTransitionGrace;
+        session.AwaitingFullscreenReactivation = true;
 
-    private static bool IsDisplayModeTransitionActive(ManagedSession session) =>
-        DateTime.UtcNow < session.ModeTransitionUntilUtc;
+    private static bool IsProcessAlive(uint processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            return !process.HasExited;
+        }
+        catch { return false; }
+    }
 
     private static void ActivateFullscreenWindow(IntPtr hwnd, ManagedSession session)
     {

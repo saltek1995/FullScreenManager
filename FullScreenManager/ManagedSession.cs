@@ -22,7 +22,6 @@ internal sealed class ManagedSession
     public SessionState State { get; set; }
     public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedUtc { get; set; } = DateTime.UtcNow;
-    public DateTime? MissingSince { get; set; }
     public int RetryCount { get; set; }
     public DateTime NextRetryUtc { get; set; }
 
@@ -31,8 +30,7 @@ internal sealed class ManagedSession
     [JsonIgnore] public DateTime NextNameSyncUtc { get; set; }
     [JsonIgnore] public DateTime? DesktopMissingSince { get; set; }
     [JsonIgnore] public DateTime? OriginMissingSince { get; set; }
-    [JsonIgnore] public DateTime? FullscreenLostSince { get; set; }
-    [JsonIgnore] public DateTime ModeTransitionUntilUtc { get; set; }
+    [JsonIgnore] public bool AwaitingFullscreenReactivation { get; set; }
     [JsonIgnore] public bool WasOnDedicatedDesktop { get; set; }
     [JsonIgnore] public bool WasForeground { get; set; }
     [JsonIgnore] public IntPtr Hwnd => new(WindowHandle);
