@@ -93,7 +93,8 @@ internal sealed class ManagerContext : ApplicationContext
     {
         var desktop = _desktops.Current();
         var host = _sessions.Values.Distinct().FirstOrDefault(session => session.Dedicated?.Id == desktop.Id);
-        if (host is null || !BelongsToApplication(hwnd, host)) SendToNewDesktop(hwnd, desktop);
+        if (host is null) SendToNewDesktop(hwnd, desktop);
+        else if (!BelongsToApplication(hwnd, host)) SendToNewDesktop(hwnd, ResolveUnmanagedOrigin(desktop));
         else AppLogger.Info($"Вспомогательное полноэкранное окно {hwnd} оставлено в Space {host.DedicatedDesktopId}");
     }
 
@@ -302,16 +303,17 @@ internal sealed class ManagerContext : ApplicationContext
     private DesktopService.Desktop? ProcessStartupWindow(StartupWindow startup)
     {
         if (IsAlreadyManaged(startup.Handle)) return null;
+        var origin = ResolveUnmanagedOrigin(startup.Origin);
         DesktopService.Desktop? dedicated = null;
         ManagedSession? managed = null;
         try
         {
             dedicated = _desktops.Create();
-            _desktopStore.Track(dedicated.Id, startup.Origin.Id);
+            _desktopStore.Track(dedicated.Id, origin.Id);
             _desktops.MoveAfterPrimary(dedicated);
             var name = GetApplicationName(startup.Handle);
             NativeMethods.GetWindowThreadProcessId(startup.Handle, out var pid);
-            managed = CreateSession(startup.Handle, pid, startup.Origin, dedicated, name);
+            managed = CreateSession(startup.Handle, pid, origin, dedicated, name);
             try { _desktops.SetName(dedicated, name); } catch (Exception ex) { AppLogger.Warning(ex.Message); }
             _desktops.MoveWindow(startup.Handle, dedicated);
             managed.State = SessionState.Active;
@@ -320,12 +322,12 @@ internal sealed class ManagerContext : ApplicationContext
         }
         catch (COMException ex) when ((uint)ex.HResult == 0x8002802B)
         {
-            RollbackCreatedSession(managed, dedicated, startup.Origin);
+            RollbackCreatedSession(managed, dedicated, origin);
             return null;
         }
         catch (Exception ex)
         {
-            RollbackCreatedSession(managed, dedicated, startup.Origin);
+            RollbackCreatedSession(managed, dedicated, origin);
             ShowError("Не удалось обработать уже открытое полноэкранное окно", ex);
             return null;
         }
@@ -340,9 +342,9 @@ internal sealed class ManagerContext : ApplicationContext
         ManagedSession? managed = null;
         try
         {
-            // A fullscreen window opened from another managed Space must return
-            // to that Space, just like a nested fullscreen view on macOS.
-            var origin = knownOrigin ?? _desktops.Current();
+            // Dedicated Spaces are siblings. Using another managed Space as an
+            // origin can create ownership cycles and leave an empty desktop.
+            var origin = ResolveUnmanagedOrigin(knownOrigin ?? _desktops.Current());
             dedicated = _desktops.Create();
             _desktopStore.Track(dedicated.Id, origin.Id);
             _desktops.MoveAfterPrimary(dedicated);
@@ -476,7 +478,40 @@ internal sealed class ManagerContext : ApplicationContext
             BeginDisplayModeTransition(session);
             _sessions.Add(session.Hwnd, session);
         }
+        RepairOriginChains();
         SaveSessions();
+    }
+
+    private void RepairOriginChains()
+    {
+        foreach (var session in _sessions.Values.Distinct())
+        {
+            if (session.Origin is null) continue;
+            var origin = ResolveUnmanagedOrigin(session.Origin);
+            if (origin.Id == session.OriginDesktopId) continue;
+            AppLogger.Warning($"Исправлена циклическая цепочка Space {session.DedicatedDesktopId}: исходный стол {origin.Id}");
+            session.Origin = origin;
+            session.OriginDesktopId = origin.Id;
+            session.UpdatedUtc = DateTime.UtcNow;
+        }
+    }
+
+    private DesktopService.Desktop ResolveUnmanagedOrigin(DesktopService.Desktop candidate)
+    {
+        var visited = new HashSet<Guid>();
+        while (visited.Add(candidate.Id))
+        {
+            var owner = _sessions.Values.Distinct()
+                .FirstOrDefault(session => session.DedicatedDesktopId == candidate.Id);
+            if (owner is null) return candidate;
+            var parent = owner.Origin ?? _desktops.Find(owner.OriginDesktopId);
+            if (parent is null) break;
+            candidate = parent;
+        }
+
+        var managedIds = _sessions.Values.Select(session => session.DedicatedDesktopId).ToHashSet();
+        return _desktops.GetAll().FirstOrDefault(desktop => !managedIds.Contains(desktop.Id))
+            ?? throw new InvalidOperationException("Не найден обычный рабочий стол для возврата окна.");
     }
 
     private static void BeginDisplayModeTransition(ManagedSession session) =>
