@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using static FullScreenManager.WindowInspector;
 using Timer = System.Windows.Forms.Timer;
 
@@ -7,38 +6,56 @@ namespace FullScreenManager;
 
 internal sealed class ManagerContext : ApplicationContext
 {
-    private readonly Timer _timer = new() { Interval = 100 };
+    private readonly Timer _timer = new() { Interval = 200 };
     private DesktopService _desktops = new();
-    private readonly Dictionary<IntPtr, bool> _previous = [];
     private readonly Dictionary<IntPtr, ManagedSession> _sessions = [];
+    private readonly HashSet<IntPtr> _suppressedWindows = [];
+    private readonly Dictionary<IntPtr, long> _discoveryRetryScan = [];
+    private readonly Dictionary<Guid, int> _orphanAbsenceObservations = [];
+    private readonly Dictionary<Guid, long> _orphanRetryScan = [];
     private readonly SessionStore _sessionStore = new();
     private readonly ManagedDesktopStore _desktopStore = new();
-    private readonly Queue<StartupWindow> _startupWindows = new();
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _enabledItem;
+    private bool _initialDiscovery = true;
     private bool _busy;
     private bool _enabled = true;
+    private long _scanNumber;
 
     public ManagerContext()
     {
         RecoverSessions();
-        SnapshotWindows();
-
         (_tray, _enabledItem) = TrayUi.Create(ExitThread);
-        _enabledItem.CheckedChanged += (_, _) => _enabled = _enabledItem.Checked;
-
+        _enabledItem.CheckedChanged += (_, _) =>
+        {
+            _enabled = _enabledItem.Checked;
+            if (_enabled) _initialDiscovery = true;
+        };
         _timer.Tick += Tick;
         _timer.Start();
     }
 
     private void Tick(object? sender, EventArgs args)
     {
+        if (_busy) return;
+        _busy = true;
         try { TickCore(); }
         catch (Exception ex)
         {
             AppLogger.Error("Сбой цикла мониторинга; COM-подключение будет восстановлено", ex);
             ReconnectDesktopService();
         }
+        finally { _busy = false; }
+    }
+
+    private void TickCore()
+    {
+        _scanNumber++;
+        RepairSessionIndex();
+        MonitorSessions();
+        ReconcileTrackedDesktops();
+        if (_enabled) DiscoverFullscreenWindows();
+        _initialDiscovery = false;
     }
 
     private void ReconnectDesktopService()
@@ -52,113 +69,206 @@ internal sealed class ManagerContext : ApplicationContext
                 session.Origin = _desktops.Find(session.OriginDesktopId);
             }
         }
-        catch (Exception ex) { AppLogger.Error("Explorer пока не готов принять новое COM-подключение", ex); }
+        catch (Exception ex)
+        {
+            AppLogger.Error("Explorer пока не готов принять новое COM-подключение", ex);
+        }
     }
 
-    private void TickCore()
+    private void DiscoverFullscreenWindows()
     {
-        if (_busy) return;
-
-        MonitorSessions();
-        if (_busy || !_enabled) return;
-
-        if (_startupWindows.Count > 0)
+        var foreground = NativeMethods.GetForegroundWindow();
+        var candidates = new List<WindowCandidate>();
+        Enumerate(hwnd =>
         {
-            ProcessStartupWindows();
+            var fullscreen = IsFullscreen(hwnd);
+            if (!fullscreen)
+            {
+                _suppressedWindows.Remove(hwnd);
+                _discoveryRetryScan.Remove(hwnd);
+                return;
+            }
+            var suppressed = _suppressedWindows.Contains(hwnd);
+            var managed = IsAlreadyManaged(hwnd);
+            var retryReady = !_discoveryRetryScan.TryGetValue(hwnd, out var retryAt) || _scanNumber >= retryAt;
+            if (!StatePolicy.ShouldDiscover(fullscreen, suppressed, managed,
+                    _initialDiscovery, hwnd == foreground, retryReady)) return;
+            var origin = _desktops.GetWindowDesktop(hwnd);
+            if (origin is not null) candidates.Add(new WindowCandidate(hwnd, origin, hwnd == foreground));
+        });
+
+        // Move the foreground window last, then activate only its resulting Space.
+        foreach (var candidate in candidates.OrderBy(item => item.IsForeground))
+            HandleFullscreenCandidate(candidate);
+    }
+
+    private void HandleFullscreenCandidate(WindowCandidate candidate)
+    {
+        if (!NativeMethods.IsWindow(candidate.Handle) || !IsFullscreen(candidate.Handle) ||
+            IsAlreadyManaged(candidate.Handle)) return;
+
+        var host = FindSessionByDesktop(candidate.Origin.Id);
+        if (host is not null && BelongsToApplication(candidate.Handle, host))
+        {
+            _suppressedWindows.Add(candidate.Handle);
+            AppLogger.Info($"Вспомогательное полноэкранное окно {candidate.Handle} оставлено в Space {host.DedicatedDesktopId}");
             return;
         }
 
-        var alive = ScanWindows();
-        foreach (var hwnd in _previous.Keys.Where(hwnd => !alive.Contains(hwnd)).ToList())
-            _previous.Remove(hwnd);
+        TryCreateSession(candidate);
     }
 
-    private HashSet<IntPtr> ScanWindows()
+    private void TryCreateSession(WindowCandidate candidate)
     {
-        var alive = new HashSet<IntPtr>();
-        Enumerate(hwnd => { alive.Add(hwnd); InspectWindow(hwnd); });
-        return alive;
+        DesktopService.Desktop? dedicated = null;
+        ManagedSession? session = null;
+        try
+        {
+            var origin = ResolveUnmanagedOrigin(candidate.Origin);
+            if (!NativeMethods.IsWindow(candidate.Handle) || !IsFullscreen(candidate.Handle)) return;
+
+            dedicated = _desktops.Create();
+            _desktopStore.Track(dedicated.Id, origin.Id);
+            _desktops.MoveAfterPrimary(dedicated);
+
+            NativeMethods.GetWindowThreadProcessId(candidate.Handle, out var processId);
+            var name = GetApplicationName(candidate.Handle);
+            session = RegisterSession(candidate.Handle, processId, origin, dedicated, name);
+            session.NextNameSyncUtc = TrySetDesktopName(dedicated, name)
+                ? DateTime.MaxValue
+                : DateTime.UtcNow.AddSeconds(5);
+
+            _desktops.MoveWindow(candidate.Handle, dedicated);
+            if (!_desktops.IsWindowOnDesktop(candidate.Handle, dedicated))
+                throw new InvalidOperationException($"Windows не подтвердила перенос HWND {candidate.Handle} в Space {dedicated.Id}.");
+
+            session.State = SessionState.Active;
+            session.UpdatedUtc = DateTime.UtcNow;
+            SaveSessions();
+            if (candidate.IsForeground)
+            {
+                _desktops.Switch(dedicated);
+                ActivateFullscreenWindow(candidate.Handle, session);
+            }
+        }
+        catch (Exception ex)
+        {
+            _discoveryRetryScan[candidate.Handle] = _scanNumber + 10;
+            AppLogger.Error($"Не удалось создать Space для HWND {candidate.Handle}", ex);
+            if (session is not null) BeginCleanup(session, "ошибка создания");
+            else if (dedicated is not null) TryRemoveOrphan(dedicated.Id);
+            ShowError("Не удалось создать полноэкранный рабочий стол", ex);
+        }
     }
 
-    private void InspectWindow(IntPtr hwnd)
+    private ManagedSession RegisterSession(IntPtr hwnd, uint processId, DesktopService.Desktop origin,
+        DesktopService.Desktop dedicated, string name)
     {
-        var fullscreen = IsFullscreen(hwnd);
-        _previous.TryGetValue(hwnd, out var wasFullscreen);
-        if (!_sessions.ContainsKey(hwnd) && fullscreen && !wasFullscreen &&
-            hwnd == NativeMethods.GetForegroundWindow()) HandleNewFullscreenWindow(hwnd);
-        _previous[hwnd] = fullscreen;
-    }
+        if (IsAlreadyManaged(hwnd))
+            throw new InvalidOperationException($"HWND {hwnd} уже принадлежит активной сессии.");
+        if (FindSessionByDesktop(dedicated.Id) is not null)
+            throw new InvalidOperationException($"Space {dedicated.Id} уже принадлежит активной сессии.");
 
-    private void HandleNewFullscreenWindow(IntPtr hwnd)
-    {
-        var desktop = _desktops.Current();
-        var host = _sessions.Values.Distinct().FirstOrDefault(session => session.Dedicated?.Id == desktop.Id);
-        if (host is null) SendToNewDesktop(hwnd, desktop);
-        else if (!BelongsToApplication(hwnd, host)) SendToNewDesktop(hwnd, ResolveUnmanagedOrigin(desktop));
-        else AppLogger.Info($"Вспомогательное полноэкранное окно {hwnd} оставлено в Space {host.DedicatedDesktopId}");
+        var session = new ManagedSession
+        {
+            WindowHandle = hwnd.ToInt64(),
+            ProcessId = processId,
+            ProcessStartedUtc = GetProcessStartedUtc(processId),
+            ExecutablePath = GetExecutablePath(processId),
+            OriginDesktopId = origin.Id,
+            DedicatedDesktopId = dedicated.Id,
+            Origin = origin,
+            Dedicated = dedicated,
+            Name = name,
+            State = SessionState.Creating,
+            CreatedUtc = DateTime.UtcNow,
+            UpdatedUtc = DateTime.UtcNow,
+            AwaitingFullscreenReactivation = true
+        };
+        if (!_sessions.TryAdd(hwnd, session))
+            throw new InvalidOperationException($"Не удалось зарегистрировать HWND {hwnd}.");
+        SaveSessions();
+        AppLogger.Info($"Создана сессия {dedicated.Id} для HWND {hwnd} ({name})");
+        return session;
     }
 
     private void MonitorSessions()
     {
-        foreach (var pair in _sessions.ToList())
-            MonitorSession(pair.Key, pair.Value);
+        foreach (var session in _sessions.Values.Distinct().ToList())
+            MonitorSession(session);
     }
 
-    private void MonitorSession(IntPtr hwnd, ManagedSession session)
+    private void MonitorSession(ManagedSession session)
     {
         var dedicated = _desktops.Find(session.DedicatedDesktopId);
         if (dedicated is null)
         {
-            HandleMissingDesktop(session);
+            session.MissingDesktopObservations++;
+            if (session.MissingDesktopObservations >= StatePolicy.MissingConfirmationCount)
+                CompleteSession(session, "Space отсутствует в трёх последовательных снимках");
             return;
         }
 
-        session.DesktopMissingSince = null;
+        session.MissingDesktopObservations = 0;
         session.Dedicated = dedicated;
         if (!EnsureOrigin(session, dedicated)) return;
 
-        if (session.State == SessionState.RetryRequired)
+        if (session.State != SessionState.Active)
         {
-            if (DateTime.UtcNow >= session.NextRetryUtc) CleanupSession(hwnd, session, false);
+            if (DateTime.UtcNow >= session.NextRetryUtc) CleanupSession(session);
             return;
         }
 
-        if (IsSessionOwnerWindow(hwnd, session)) MonitorOwnerWindow(hwnd, session);
-        else MonitorReplacementWindow(hwnd, session);
+        if (IsSessionOwnerWindow(session.Hwnd, session))
+        {
+            var ownerDesktop = _desktops.GetWindowDesktop(session.Hwnd);
+            if (ownerDesktop is not null && ownerDesktop.Id != dedicated.Id)
+            {
+                RestoreOwnerToDedicatedSpace(session);
+                return;
+            }
+            MonitorOwnerWindow(session);
+        }
+        else MonitorReplacementWindow(session);
     }
 
-    private void HandleMissingDesktop(ManagedSession session)
+    private void RestoreOwnerToDedicatedSpace(ManagedSession session)
     {
-        if (session.State is SessionState.Removing or SessionState.RetryRequired)
+        try
         {
-            ForgetSession(session);
-            return;
+            if (session.Dedicated is null || !IsFullscreen(session.Hwnd))
+            {
+                BeginCleanup(session, "окно покинуло свой Space");
+                return;
+            }
+            var foreground = session.Hwnd == NativeMethods.GetForegroundWindow();
+            _desktops.MoveWindow(session.Hwnd, session.Dedicated);
+            if (foreground)
+            {
+                _desktops.Switch(session.Dedicated);
+                ActivateFullscreenWindow(session.Hwnd, session);
+            }
+            AppLogger.Warning($"Сессия {session.DedicatedDesktopId}: окно возвращено в принадлежащий ему Space");
         }
-
-        session.DesktopMissingSince ??= DateTime.UtcNow;
-        if (DateTime.UtcNow - session.DesktopMissingSince.Value < TimeSpan.FromSeconds(2)) return;
-        AppLogger.Warning($"Созданный стол {session.DedicatedDesktopId} был удалён вне приложения");
-        ForgetSession(session);
+        catch (Exception ex) { ScheduleRetry(session, ex); }
     }
 
     private bool EnsureOrigin(ManagedSession session, DesktopService.Desktop dedicated)
     {
-        var origin = _desktops.Find(session.OriginDesktopId);
-        if (origin is not null && origin.Id != dedicated.Id)
-        {
-            session.OriginMissingSince = null;
-            session.Origin = origin;
-            return true;
-        }
-
-        session.OriginMissingSince ??= DateTime.UtcNow;
-        if (DateTime.UtcNow - session.OriginMissingSince.Value < TimeSpan.FromSeconds(2)) return false;
         try
         {
-            session.Origin = SessionRecovery.ResolveOrigin(_desktops, session, dedicated);
-            session.OriginDesktopId = session.Origin.Id;
-            session.OriginMissingSince = null;
-            SaveSessions();
+            var stored = _desktops.Find(session.OriginDesktopId);
+            var origin = stored is not null && stored.Id != dedicated.Id
+                ? ResolveUnmanagedOrigin(stored)
+                : FindSafeOrigin(dedicated.Id);
+            if (origin.Id != session.OriginDesktopId)
+            {
+                session.OriginDesktopId = origin.Id;
+                session.UpdatedUtc = DateTime.UtcNow;
+                _desktopStore.Track(session.DedicatedDesktopId, origin.Id);
+                SaveSessions();
+            }
+            session.Origin = origin;
             return true;
         }
         catch (Exception ex)
@@ -168,314 +278,250 @@ internal sealed class ManagerContext : ApplicationContext
         }
     }
 
-    private void MonitorOwnerWindow(IntPtr hwnd, ManagedSession session)
+    private void MonitorOwnerWindow(ManagedSession session)
     {
-        if (!NativeMethods.IsWindowVisible(hwnd) || session.Dedicated is null)
+        var hwnd = session.Hwnd;
+        var dedicated = session.Dedicated!;
+        var current = _desktops.IsCurrent(dedicated);
+        var foreground = hwnd == NativeMethods.GetForegroundWindow();
+        session.MissingWindowObservations = 0;
+
+        var visible = NativeMethods.IsWindowVisible(hwnd);
+        var iconic = NativeMethods.IsIconic(hwnd);
+        var fullscreen = visible && !iconic && IsFullscreen(hwnd);
+        var clearlyWindowed = visible && !iconic && !fullscreen && IsClearlyWindowed(hwnd);
+        var processAlive = IsProcessAlive(session);
+        if (session.AwaitingFullscreenReactivation && current && !session.ActivationRequested)
         {
-            AppLogger.Info($"Сессия {session.DedicatedDesktopId}: окно скрыто в трей");
-            CleanupSession(hwnd, session, false);
+            ActivateFullscreenWindow(hwnd, session);
+            return;
+        }
+        var observation = new WindowObservation(true, visible, iconic, fullscreen, clearlyWindowed,
+            current, foreground, session.AwaitingFullscreenReactivation, processAlive,
+            IsSharedWindowHost(session.ExecutablePath), 0);
+        if (StatePolicy.Decide(observation) == SessionObservationAction.Cleanup)
+        {
+            var reason = !visible ? "окно скрыто" : iconic ? "окно свёрнуто" : "выход из полноэкранного режима";
+            BeginCleanup(session, reason);
             return;
         }
 
-        WindowMover.Reconcile(_desktops, session);
-        UpdateDesktopName(hwnd, session);
-        var isCurrent = _desktops.IsCurrent(session.Dedicated);
-        var isForeground = hwnd == NativeMethods.GetForegroundWindow();
-        var wasCurrent = session.WasOnDedicatedDesktop;
-        var wasForeground = session.WasForeground;
-        session.WasOnDedicatedDesktop = isCurrent;
-        session.WasForeground = isForeground;
-        if ((isCurrent && !wasCurrent) || (isForeground && !wasForeground))
-            BeginDisplayModeTransition(session);
-
-        if (NativeMethods.IsIconic(hwnd))
+        if (visible)
         {
-            // A deliberate minimize starts while the game is foreground on its
-            // current Space. Minimize/restore caused by an exclusive mode switch
-            // must not remove the dedicated desktop.
-            if (session.AwaitingFullscreenReactivation && isCurrent)
-            {
-                // Activation is requested once when this Space is selected.
-                // Reasserting foreground from the monitor loop makes a foreign
-                // window and the game steal focus from each other every tick.
-                return;
-            }
-            else if (isCurrent && wasCurrent && wasForeground)
-            {
-                AppLogger.Info($"Сессия {session.DedicatedDesktopId}: окно свёрнуто");
-                ReturnWindow(hwnd, session, true);
-            }
-            return;
+            WindowMover.Reconcile(_desktops, session);
+            UpdateDesktopName(hwnd, session);
         }
-
-        MonitorFullscreenState(hwnd, session, isCurrent, isForeground);
-    }
-
-    private void MonitorFullscreenState(IntPtr hwnd, ManagedSession session, bool isCurrent, bool isForeground)
-    {
-        if (IsFullscreen(hwnd))
+        if (fullscreen)
         {
             session.AwaitingFullscreenReactivation = false;
-            return;
+            session.ActivationRequested = false;
         }
-        if (!isForeground || !isCurrent || session.AwaitingFullscreenReactivation ||
-            !WindowInspector.IsClearlyWindowed(hwnd)) return;
-        AppLogger.Info($"Сессия {session.DedicatedDesktopId}: подтверждён выход из полноэкранного режима");
-        ReturnWindow(hwnd, session, false);
+        RememberWindowPosition(session, current, foreground);
     }
 
-    private void MonitorReplacementWindow(IntPtr hwnd, ManagedSession session)
+    private static void RememberWindowPosition(ManagedSession session, bool current, bool foreground)
+    {
+        if (!current) session.ActivationRequested = false;
+        session.WasOnDedicatedDesktop = current;
+        session.WasForeground = foreground;
+    }
+
+    private void MonitorReplacementWindow(ManagedSession session)
     {
         var replacement = FindReplacementWindow(session);
-        if (replacement == IntPtr.Zero)
+        if (replacement != IntPtr.Zero)
         {
-            if (IsProcessAlive(session.ProcessId)) return;
-            AppLogger.Info($"Сессия {session.DedicatedDesktopId}: окно закрыто");
-            CleanupSession(hwnd, session, false);
+            RebindSession(session, replacement);
             return;
         }
 
-        _sessions.Remove(hwnd);
-        session.WindowHandle = replacement.ToInt64();
-        session.UpdatedUtc = DateTime.UtcNow;
-        session.WasForeground = false;
-        session.WasOnDedicatedDesktop = false;
-        BeginDisplayModeTransition(session);
-        _sessions[replacement] = session;
-        _previous[replacement] = IsFullscreen(replacement);
-        UpdateDesktopName(replacement, session);
-        SaveSessions();
+        session.MissingWindowObservations++;
+        var processAlive = IsProcessAlive(session);
+        var desktopCurrent = session.Dedicated is not null && _desktops.IsCurrent(session.Dedicated);
+        var observation = new WindowObservation(false, false, false, false, false,
+            desktopCurrent, false, session.AwaitingFullscreenReactivation, processAlive,
+            IsSharedWindowHost(session.ExecutablePath), session.MissingWindowObservations);
+        if (StatePolicy.Decide(observation) == SessionObservationAction.Cleanup)
+            BeginCleanup(session, "окно закрыто и замена не найдена");
     }
 
     private IntPtr FindReplacementWindow(ManagedSession session)
     {
-        var fullscreenMatches = new List<IntPtr>();
-        var visibleMatches = new List<IntPtr>();
+        var fullscreenOnSpace = new List<IntPtr>();
+        var visibleOnSpace = new List<IntPtr>();
         NativeMethods.EnumWindows((hwnd, _) =>
         {
-            NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
-            if (pid != session.ProcessId || !NativeMethods.IsWindowVisible(hwnd)) return true;
-            visibleMatches.Add(hwnd);
-            if (IsFullscreen(hwnd)) fullscreenMatches.Add(hwnd);
+            if (!NativeMethods.IsWindowVisible(hwnd) || IsAlreadyManaged(hwnd)) return true;
+            NativeMethods.GetWindowThreadProcessId(hwnd, out var processId);
+            if (!IsSameProcessInstance(processId, session)) return true;
+            if (session.Dedicated is null || !_desktops.IsWindowOnDesktop(hwnd, session.Dedicated)) return true;
+            visibleOnSpace.Add(hwnd);
+            if (IsFullscreen(hwnd)) fullscreenOnSpace.Add(hwnd);
             return true;
         }, IntPtr.Zero);
-        if (fullscreenMatches.Count == 1) return fullscreenMatches[0];
-        return session.AwaitingFullscreenReactivation && visibleMatches.Count == 1
-            ? visibleMatches[0]
+        if (fullscreenOnSpace.Count == 1) return fullscreenOnSpace[0];
+        return session.AwaitingFullscreenReactivation && visibleOnSpace.Count == 1
+            ? visibleOnSpace[0]
             : IntPtr.Zero;
     }
 
-    private void ProcessStartupWindows()
+    private void RebindSession(ManagedSession session, IntPtr replacement)
     {
-        _busy = true;
-        _timer.Stop();
-        var foreground = NativeMethods.GetForegroundWindow();
-        DesktopService.Desktop? desktopToShow = null;
-        var windowToShow = IntPtr.Zero;
-
-        try
+        var previous = session.Hwnd;
+        _sessions.Remove(previous);
+        if (_sessions.ContainsKey(replacement))
         {
-            while (_startupWindows.Count > 0)
-            {
-                var startup = _startupWindows.Dequeue();
-                if (!NativeMethods.IsWindow(startup.Handle) || !IsFullscreen(startup.Handle)) continue;
-                var created = ProcessStartupWindow(startup);
-                if (created is not null && (startup.Handle == foreground || desktopToShow is null))
-                {
-                    desktopToShow = created;
-                    windowToShow = startup.Handle;
-                }
-            }
-
-            if (desktopToShow is not null)
-            {
-                _desktops.Switch(desktopToShow);
-                if (_sessions.TryGetValue(windowToShow, out var session)) ActivateFullscreenWindow(windowToShow, session);
-            }
+            _sessions[previous] = session;
+            ScheduleRetry(session, new InvalidOperationException($"HWND замены {replacement} уже занят."));
+            return;
         }
-        finally
-        {
-            _busy = false;
-            _timer.Start();
-        }
+        session.WindowHandle = replacement.ToInt64();
+        session.MissingWindowObservations = 0;
+        session.WasForeground = false;
+        session.WasOnDedicatedDesktop = false;
+        session.AwaitingFullscreenReactivation = true;
+        session.ActivationRequested = false;
+        session.UpdatedUtc = DateTime.UtcNow;
+        _sessions.Add(replacement, session);
+        UpdateDesktopName(replacement, session);
+        SaveSessions();
+        AppLogger.Info($"Сессия {session.DedicatedDesktopId}: HWND заменён {previous} → {replacement}");
     }
 
-    private DesktopService.Desktop? ProcessStartupWindow(StartupWindow startup)
+    private void BeginCleanup(ManagedSession session, string reason)
     {
-        if (IsAlreadyManaged(startup.Handle)) return null;
-        var origin = ResolveUnmanagedOrigin(startup.Origin);
-        DesktopService.Desktop? dedicated = null;
-        ManagedSession? managed = null;
-        try
-        {
-            dedicated = _desktops.Create();
-            _desktopStore.Track(dedicated.Id, origin.Id);
-            _desktops.MoveAfterPrimary(dedicated);
-            var name = GetApplicationName(startup.Handle);
-            NativeMethods.GetWindowThreadProcessId(startup.Handle, out var pid);
-            managed = CreateSession(startup.Handle, pid, origin, dedicated, name);
-            try { _desktops.SetName(dedicated, name); } catch (Exception ex) { AppLogger.Warning(ex.Message); }
-            _desktops.MoveWindow(startup.Handle, dedicated);
-            managed.State = SessionState.Active;
-            SaveSessions();
-            return dedicated;
-        }
-        catch (COMException ex) when ((uint)ex.HResult == 0x8002802B)
-        {
-            RollbackCreatedSession(managed, dedicated, origin);
-            return null;
-        }
-        catch (Exception ex)
-        {
-            RollbackCreatedSession(managed, dedicated, origin);
-            ShowError("Не удалось обработать уже открытое полноэкранное окно", ex);
-            return null;
-        }
+        if (session.State != SessionState.Active && session.State != SessionState.Creating) return;
+        session.State = SessionState.RetryRequired;
+        session.NextRetryUtc = DateTime.UtcNow;
+        session.UpdatedUtc = DateTime.UtcNow;
+        _suppressedWindows.Add(session.Hwnd);
+        SaveSessions();
+        AppLogger.Info($"Сессия {session.DedicatedDesktopId}: начата очистка ({reason})");
+        CleanupSession(session);
     }
 
-    private void SendToNewDesktop(IntPtr hwnd, DesktopService.Desktop? knownOrigin)
+    private void CleanupSession(ManagedSession session)
     {
-        if (IsAlreadyManaged(hwnd)) return;
-        _busy = true;
-        _timer.Stop();
-        DesktopService.Desktop? dedicated = null;
-        ManagedSession? managed = null;
+        if (session.Dedicated is null) return;
         try
         {
-            // Dedicated Spaces are siblings. Using another managed Space as an
-            // origin can create ownership cycles and leave an empty desktop.
-            var origin = ResolveUnmanagedOrigin(knownOrigin ?? _desktops.Current());
-            dedicated = _desktops.Create();
-            _desktopStore.Track(dedicated.Id, origin.Id);
-            _desktops.MoveAfterPrimary(dedicated);
-            var desktopName = GetApplicationName(hwnd);
-            NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
-            managed = CreateSession(hwnd, pid, origin, dedicated, desktopName);
-            try { _desktops.SetName(dedicated, desktopName); }
-            catch (Exception ex) { AppLogger.Error($"Не удалось назвать Space {dedicated.Id}", ex); }
-            _desktops.MoveWindow(hwnd, dedicated);
-            managed.State = SessionState.Active;
-            SaveSessions();
-            _desktops.Switch(dedicated);
-            ActivateFullscreenWindow(hwnd, managed);
-        }
-        catch (Exception ex)
-        {
-            RollbackCreatedSession(managed, dedicated, managed?.Origin ?? _desktops.Current());
-            ShowError("Не удалось создать полноэкранный рабочий стол", ex);
-        }
-        finally
-        {
-            _busy = false;
-            _timer.Start();
-        }
-    }
-
-    private void ReturnWindow(IntPtr hwnd, ManagedSession session, bool minimized)
-    {
-        _busy = true;
-        _timer.Stop();
-        try
-        {
-            if (session.Origin is null || session.Dedicated is null)
-                throw new InvalidOperationException("Сессия потеряла ссылки на рабочие столы.");
-            session.State = SessionState.Returning;
+            var origin = session.Origin ?? FindSafeOrigin(session.DedicatedDesktopId);
+            session.Origin = origin;
+            session.OriginDesktopId = origin.Id;
+            session.State = SessionState.Removing;
             session.UpdatedUtc = DateTime.UtcNow;
             SaveSessions();
-            _desktops.MoveWindow(hwnd, session.Origin);
-            WindowMover.MoveAllToOrigin(_desktops, session);
-            ReparentChildSessions(session);
-            var wasOnDedicated = _desktops.IsCurrent(session.Dedicated);
-            if (wasOnDedicated) _desktops.Switch(session.Origin);
-            session.State = SessionState.Removing;
+
+            if (NativeMethods.IsWindow(session.Hwnd) &&
+                _desktops.IsWindowOnDesktop(session.Hwnd, session.Dedicated))
+                _desktops.MoveWindow(session.Hwnd, origin);
+            WindowMover.MoveAll(_desktops, session.Dedicated, origin);
+            if (_desktops.IsCurrent(session.Dedicated)) _desktops.Switch(origin);
+            _desktops.Remove(session.Dedicated, origin);
+
+            session.State = SessionState.RetryRequired;
+            session.RetryCount = 0;
+            session.NextRetryUtc = DateTime.UtcNow.AddMilliseconds(500);
+            session.UpdatedUtc = DateTime.UtcNow;
             SaveSessions();
-            _desktops.Remove(session.Dedicated, session.Origin);
-            MarkRemovalPending(session);
-            if (!minimized)
+        }
+        catch (Exception ex) { ScheduleRetry(session, ex); }
+    }
+
+    private void CompleteSession(ManagedSession session, string reason)
+    {
+        foreach (var key in _sessions.Where(pair => ReferenceEquals(pair.Value, session))
+                     .Select(pair => pair.Key).ToList())
+            _sessions.Remove(key);
+        _desktopStore.Forget(session.DedicatedDesktopId);
+        _orphanAbsenceObservations.Remove(session.DedicatedDesktopId);
+        _orphanRetryScan.Remove(session.DedicatedDesktopId);
+        SaveSessions();
+        AppLogger.Info($"Сессия {session.DedicatedDesktopId}: завершена ({reason})");
+    }
+
+    private void ReconcileTrackedDesktops()
+    {
+        var sessionDesktopIds = _sessions.Values.Select(session => session.DedicatedDesktopId).ToHashSet();
+        var desktops = _desktops.GetAll().ToDictionary(desktop => desktop.Id);
+        var confirmedAbsent = new List<Guid>();
+        foreach (var record in _desktopStore.Records.Where(record => !sessionDesktopIds.Contains(record.DesktopId)))
+        {
+            if (!desktops.ContainsKey(record.DesktopId))
             {
-                NativeMethods.SetForegroundWindow(hwnd);
+                var observations = _orphanAbsenceObservations.GetValueOrDefault(record.DesktopId) + 1;
+                _orphanAbsenceObservations[record.DesktopId] = observations;
+                if (observations >= StatePolicy.MissingConfirmationCount)
+                {
+                    confirmedAbsent.Add(record.DesktopId);
+                    _orphanAbsenceObservations.Remove(record.DesktopId);
+                    _orphanRetryScan.Remove(record.DesktopId);
+                }
+                continue;
             }
-            _previous[hwnd] = false;
+
+            _orphanAbsenceObservations.Remove(record.DesktopId);
+            if (!_orphanRetryScan.TryGetValue(record.DesktopId, out var retryAt) || _scanNumber >= retryAt)
+                TryRemoveOrphan(record.DesktopId);
+        }
+        _desktopStore.ForgetMany(confirmedAbsent);
+    }
+
+    private void TryRemoveOrphan(Guid desktopId)
+    {
+        try
+        {
+            var desktop = _desktops.Find(desktopId);
+            if (desktop is null) return;
+            var fallback = FindSafeOrigin(desktopId);
+            WindowMover.MoveAll(_desktops, desktop, fallback);
+            if (_desktops.IsCurrent(desktop)) _desktops.Switch(fallback);
+            _desktops.Remove(desktop, fallback);
+            _orphanRetryScan[desktopId] = _scanNumber + 3;
+            AppLogger.Info($"Запрошено удаление осиротевшего Space {desktopId}");
         }
         catch (Exception ex)
         {
-            ScheduleRetry(session, ex);
-            ShowError("Не удалось вернуть окно на исходный рабочий стол", ex);
-        }
-        finally
-        {
-            _busy = false;
-            _timer.Start();
+            _orphanRetryScan[desktopId] = _scanNumber + 25;
+            AppLogger.Error($"Не удалось удалить осиротевший Space {desktopId}", ex);
         }
     }
 
-    private void CleanupSession(IntPtr hwnd, ManagedSession session, bool moveWindow)
+    private DesktopService.Desktop ResolveUnmanagedOrigin(DesktopService.Desktop candidate)
     {
-        _busy = true;
-        _timer.Stop();
-        try
+        var visited = new HashSet<Guid>();
+        while (visited.Add(candidate.Id))
         {
-            if (session.Origin is null || session.Dedicated is null)
-                throw new InvalidOperationException("Не удалось восстановить рабочие столы сессии.");
-            session.State = SessionState.Removing;
-            SaveSessions();
-            if (moveWindow && NativeMethods.IsWindow(hwnd)) _desktops.MoveWindow(hwnd, session.Origin);
-            WindowMover.MoveAllToOrigin(_desktops, session);
-            ReparentChildSessions(session);
-            if (_desktops.IsCurrent(session.Dedicated)) _desktops.Switch(session.Origin);
-            _desktops.Remove(session.Dedicated, session.Origin);
-            MarkRemovalPending(session);
+            var owner = FindSessionByDesktop(candidate.Id);
+            if (owner is null) return candidate;
+            var parent = owner.Origin ?? _desktops.Find(owner.OriginDesktopId);
+            if (parent is null) break;
+            candidate = parent;
         }
-        catch (Exception ex) { ScheduleRetry(session, ex); }
-        finally
-        {
-            _busy = false;
-            _timer.Start();
-        }
+        return FindSafeOrigin(Guid.Empty);
     }
 
-    private ManagedSession CreateSession(IntPtr hwnd, uint processId, DesktopService.Desktop origin,
-        DesktopService.Desktop dedicated, string name)
+    private DesktopService.Desktop FindSafeOrigin(Guid excludedDesktopId)
     {
-        if (IsAlreadyManaged(hwnd))
-            throw new InvalidOperationException($"HWND {hwnd} уже принадлежит активной сессии.");
-        if (_sessions.Values.Any(existing => existing.DedicatedDesktopId == dedicated.Id))
-            throw new InvalidOperationException($"Space {dedicated.Id} уже принадлежит активной сессии.");
-
-        var session = new ManagedSession
-        {
-            WindowHandle = hwnd.ToInt64(),
-            ProcessId = processId,
-            ExecutablePath = GetExecutablePath(processId),
-            OriginDesktopId = origin.Id,
-            DedicatedDesktopId = dedicated.Id,
-            Origin = origin,
-            Dedicated = dedicated,
-            Name = name,
-            State = SessionState.Creating,
-            CreatedUtc = DateTime.UtcNow,
-            UpdatedUtc = DateTime.UtcNow
-        };
-        BeginDisplayModeTransition(session);
-        if (!_sessions.TryAdd(hwnd, session))
-            throw new InvalidOperationException($"Не удалось зарегистрировать HWND {hwnd}.");
-        _desktopStore.Track(dedicated.Id, origin.Id);
-        SaveSessions();
-        AppLogger.Info($"Создана сессия {dedicated.Id} для HWND {hwnd} ({name})");
-        return session;
+        var managedIds = _desktopStore.Records.Select(record => record.DesktopId).ToHashSet();
+        managedIds.Add(excludedDesktopId);
+        var safe = _desktops.GetAll().FirstOrDefault(desktop => !managedIds.Contains(desktop.Id));
+        if (safe is not null) return safe;
+        safe = _desktops.Create();
+        TrySetDesktopName(safe, "Рабочий стол");
+        AppLogger.Warning($"Создан резервный обычный рабочий стол {safe.Id}");
+        return safe;
     }
 
     private void RecoverSessions()
     {
         foreach (var session in SessionRecovery.Recover(_desktops, _sessionStore, _desktopStore))
         {
-            if (IsAlreadyManaged(session.Hwnd) ||
-                _sessions.Values.Any(existing => existing.DedicatedDesktopId == session.DedicatedDesktopId))
+            if (IsAlreadyManaged(session.Hwnd) || FindSessionByDesktop(session.DedicatedDesktopId) is not null)
             {
-                AppLogger.Warning($"Пропущена дублирующая восстановленная сессия HWND {session.Hwnd}, Space {session.DedicatedDesktopId}");
+                AppLogger.Warning($"Пропущена дублирующая сессия HWND {session.Hwnd}, Space {session.DedicatedDesktopId}");
                 continue;
             }
-            BeginDisplayModeTransition(session);
             _sessions.Add(session.Hwnd, session);
         }
         RepairOriginChains();
@@ -486,107 +532,89 @@ internal sealed class ManagerContext : ApplicationContext
     {
         foreach (var session in _sessions.Values.Distinct())
         {
-            if (session.Origin is null) continue;
-            var origin = ResolveUnmanagedOrigin(session.Origin);
-            if (origin.Id == session.OriginDesktopId) continue;
-            AppLogger.Warning($"Исправлена циклическая цепочка Space {session.DedicatedDesktopId}: исходный стол {origin.Id}");
-            session.Origin = origin;
-            session.OriginDesktopId = origin.Id;
-            session.UpdatedUtc = DateTime.UtcNow;
+            if (session.Dedicated is null) continue;
+            EnsureOrigin(session, session.Dedicated);
         }
     }
 
-    private DesktopService.Desktop ResolveUnmanagedOrigin(DesktopService.Desktop candidate)
+    private void RepairSessionIndex()
     {
-        var visited = new HashSet<Guid>();
-        while (visited.Add(candidate.Id))
+        foreach (var pair in _sessions.ToList())
         {
-            var owner = _sessions.Values.Distinct()
-                .FirstOrDefault(session => session.DedicatedDesktopId == candidate.Id);
-            if (owner is null) return candidate;
-            var parent = owner.Origin ?? _desktops.Find(owner.OriginDesktopId);
-            if (parent is null) break;
-            candidate = parent;
+            if (pair.Key == pair.Value.Hwnd) continue;
+            _sessions.Remove(pair.Key);
+            if (!_sessions.TryAdd(pair.Value.Hwnd, pair.Value))
+                BeginCleanup(pair.Value, "конфликт индекса HWND");
         }
 
-        var managedIds = _sessions.Values.Select(session => session.DedicatedDesktopId).ToHashSet();
-        return _desktops.GetAll().FirstOrDefault(desktop => !managedIds.Contains(desktop.Id))
-            ?? throw new InvalidOperationException("Не найден обычный рабочий стол для возврата окна.");
+        foreach (var duplicate in _sessions.Values.GroupBy(session => session.DedicatedDesktopId)
+                     .Where(group => group.Count() > 1).SelectMany(group => group.Skip(1)).ToList())
+            BeginCleanup(duplicate, "конфликт владельцев Space");
     }
 
-    private static void BeginDisplayModeTransition(ManagedSession session) =>
-        session.AwaitingFullscreenReactivation = true;
+    private ManagedSession? FindSessionByDesktop(Guid desktopId) =>
+        _sessions.Values.Distinct().FirstOrDefault(session => session.DedicatedDesktopId == desktopId);
 
-    private static bool IsProcessAlive(uint processId)
+    private bool IsAlreadyManaged(IntPtr hwnd) =>
+        _sessions.ContainsKey(hwnd) || _sessions.Values.Any(session => session.Hwnd == hwnd);
+
+    private static bool IsSharedWindowHost(string executablePath)
     {
-        try
-        {
-            using var process = Process.GetProcessById((int)processId);
-            return !process.HasExited;
-        }
-        catch { return false; }
+        var name = Path.GetFileName(executablePath);
+        return name.Equals("ApplicationFrameHost.exe", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("RuntimeBroker.exe", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("ShellExperienceHost.exe", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsProcessAlive(ManagedSession session)
+    {
+        var started = GetProcessStartedUtc(session.ProcessId);
+        return started is not null &&
+               (session.ProcessStartedUtc is null || started.Value == session.ProcessStartedUtc.Value);
     }
 
     private static void ActivateFullscreenWindow(IntPtr hwnd, ManagedSession session)
     {
-        BeginDisplayModeTransition(session);
-        if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindowAsync(hwnd, 9); // SW_RESTORE
+        session.AwaitingFullscreenReactivation = true;
+        session.ActivationRequested = true;
+        if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindowAsync(hwnd, 9);
         NativeMethods.SetForegroundWindow(hwnd);
     }
 
-    private void SaveSessions() => _sessionStore.Save(_sessions.Values.Distinct());
-
-    private void MarkRemovalPending(ManagedSession session)
+    private bool TrySetDesktopName(DesktopService.Desktop desktop, string name)
     {
-        session.State = SessionState.RetryRequired;
-        session.NextRetryUtc = DateTime.UtcNow.AddMilliseconds(500);
-        session.UpdatedUtc = DateTime.UtcNow;
-        SaveSessions();
-    }
-
-    private void ForgetSession(ManagedSession session)
-    {
-        foreach (var key in _sessions.Where(pair => ReferenceEquals(pair.Value, session))
-                     .Select(pair => pair.Key).ToList())
-            _sessions.Remove(key);
-        // Do not immediately rediscover the same still-fullscreen transient
-        // window after its session has just been removed.
-        _previous[session.Hwnd] = NativeMethods.IsWindow(session.Hwnd) && IsFullscreen(session.Hwnd);
-        _desktopStore.Forget(session.DedicatedDesktopId);
-        SaveSessions();
-    }
-
-    private void RollbackCreatedSession(ManagedSession? session, DesktopService.Desktop? dedicated,
-        DesktopService.Desktop fallback)
-    {
-        if (dedicated is null) return;
         try
         {
-            if (session is not null) WindowMover.MoveAllToOrigin(_desktops, session);
-            if (_desktops.IsCurrent(dedicated)) _desktops.Switch(fallback);
-            _desktops.Remove(dedicated, fallback);
-            if (session is not null) MarkRemovalPending(session);
-            else if (_desktops.Find(dedicated.Id) is null) _desktopStore.Forget(dedicated.Id);
+            _desktops.SetName(desktop, name);
+            return true;
         }
-        catch (Exception cleanupError)
+        catch (Exception ex)
         {
-            if (session is not null) ScheduleRetry(session, cleanupError);
-            else AppLogger.Error($"Не удалось откатить незарегистрированный стол {dedicated.Id}", cleanupError);
+            AppLogger.Error($"Не удалось назвать Space {desktop.Id}", ex);
+            return false;
         }
     }
 
-    private void ReparentChildSessions(ManagedSession removedParent)
+    private void UpdateDesktopName(IntPtr hwnd, ManagedSession session)
     {
-        if (removedParent.Origin is null) return;
-        foreach (var child in _sessions.Values.Distinct().Where(child =>
-                     !ReferenceEquals(child, removedParent) &&
-                     child.OriginDesktopId == removedParent.DedicatedDesktopId))
+        var currentName = GetApplicationName(hwnd);
+        var nameChanged = !string.Equals(currentName, session.Name, StringComparison.Ordinal);
+        if (!nameChanged && (session.NextNameSyncUtc == DateTime.MaxValue ||
+                             DateTime.UtcNow < session.NextNameSyncUtc)) return;
+        try
         {
-            child.Origin = removedParent.Origin;
-            child.OriginDesktopId = removedParent.Origin.Id;
-            child.UpdatedUtc = DateTime.UtcNow;
+            if (session.Dedicated is null) return;
+            _desktops.SetName(session.Dedicated, currentName);
+            session.Name = currentName;
+            session.NextNameSyncUtc = DateTime.MaxValue;
+            session.UpdatedUtc = DateTime.UtcNow;
+            SaveSessions();
         }
-        SaveSessions();
+        catch (Exception ex)
+        {
+            session.NextNameSyncUtc = DateTime.UtcNow.AddSeconds(5);
+            AppLogger.Error($"Не удалось синхронизировать имя Space {session.DedicatedDesktopId}", ex);
+        }
     }
 
     private void ScheduleRetry(ManagedSession session, Exception exception)
@@ -597,64 +625,25 @@ internal sealed class ManagerContext : ApplicationContext
             Math.Min(30_000, 500 * Math.Pow(2, Math.Min(session.RetryCount, 6))));
         session.UpdatedUtc = DateTime.UtcNow;
         SaveSessions();
-        AppLogger.Error($"Операция с сессией {session.DedicatedDesktopId} будет повторена", exception);
+        AppLogger.Error($"Очистка сессии {session.DedicatedDesktopId} будет повторена", exception);
     }
+
+    private void SaveSessions() => _sessionStore.Save(_sessions.Values.Distinct());
 
     private void ShowError(string message, Exception exception) =>
         _tray.ShowBalloonTip(7000, "FullScreenManager", $"{message}: {exception.Message}", ToolTipIcon.Error);
 
-    private void SnapshotWindows()
-    {
-        var origin = _desktops.Current();
-        Enumerate(hwnd =>
-        {
-            var zoomed = IsFullscreen(hwnd);
-            _previous[hwnd] = zoomed;
-            if (zoomed && !_sessions.ContainsKey(hwnd)) _startupWindows.Enqueue(new StartupWindow(hwnd, origin));
-        });
-    }
-
-    private bool IsAlreadyManaged(IntPtr hwnd) =>
-        _sessions.ContainsKey(hwnd) || _sessions.Values.Any(session => session.Hwnd == hwnd);
-
-    private void UpdateDesktopName(IntPtr hwnd, ManagedSession session)
-    {
-        var currentName = GetApplicationName(hwnd);
-        var nameChanged = !string.Equals(currentName, session.Name, StringComparison.Ordinal);
-        if (!nameChanged && DateTime.UtcNow < session.NextNameSyncUtc) return;
-        try
-        {
-            if (session.Dedicated is null) return;
-            _desktops.SetName(session.Dedicated, currentName);
-            session.Name = currentName;
-            session.NextNameSyncUtc = DateTime.UtcNow.AddSeconds(5);
-            session.UpdatedUtc = DateTime.UtcNow;
-            SaveSessions();
-        }
-        catch (Exception ex)
-        {
-            session.NextNameSyncUtc = DateTime.UtcNow.AddSeconds(5);
-            AppLogger.Error($"Не удалось синхронизировать имя стола {session.DedicatedDesktopId}", ex);
-        }
-    }
-
     protected override void ExitThreadCore()
     {
         _timer.Stop();
-        foreach (var pair in _sessions.ToList())
+        foreach (var session in _sessions.Values.Distinct().ToList())
         {
-            var hwnd = pair.Key;
-            var session = pair.Value;
             try
             {
-                if (session.Origin is null || session.Dedicated is null) continue;
-                if (NativeMethods.IsWindow(hwnd)) _desktops.MoveWindow(hwnd, session.Origin);
-                WindowMover.MoveAllToOrigin(_desktops, session);
-                ReparentChildSessions(session);
-                if (_desktops.IsCurrent(session.Dedicated)) _desktops.Switch(session.Origin);
-                _desktops.Remove(session.Dedicated, session.Origin);
+                if (session.State == SessionState.Active) BeginCleanup(session, "выход из приложения");
+                else CleanupSession(session);
             }
-            catch { }
+            catch (Exception ex) { AppLogger.Error($"Не удалось очистить Space {session.DedicatedDesktopId} при выходе", ex); }
         }
         SaveSessions();
         _tray.Visible = false;
@@ -662,5 +651,5 @@ internal sealed class ManagerContext : ApplicationContext
         base.ExitThreadCore();
     }
 
-    private sealed record StartupWindow(IntPtr Handle, DesktopService.Desktop Origin);
+    private sealed record WindowCandidate(IntPtr Handle, DesktopService.Desktop Origin, bool IsForeground);
 }

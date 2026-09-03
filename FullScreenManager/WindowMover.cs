@@ -24,12 +24,18 @@ internal static class WindowMover
     internal static void MoveAllToOrigin(DesktopService desktops, ManagedSession session)
     {
         if (session.Origin is null || session.Dedicated is null) return;
+        MoveAll(desktops, session.Dedicated, session.Origin);
+    }
+
+    internal static void MoveAll(DesktopService desktops, DesktopService.Desktop source,
+        DesktopService.Desktop destination)
+    {
         NativeMethods.EnumWindows((hwnd, _) =>
         {
-            if (!NativeMethods.IsWindow(hwnd) || !desktops.IsWindowOnDesktop(hwnd, session.Dedicated)) return true;
+            if (!NativeMethods.IsWindow(hwnd) || !desktops.IsWindowOnDesktop(hwnd, source)) return true;
             NativeMethods.GetWindowThreadProcessId(hwnd, out var processId);
             if (processId == (uint)Environment.ProcessId) return true;
-            try { desktops.MoveWindow(hwnd, session.Origin); }
+            try { desktops.MoveWindow(hwnd, destination); }
             catch (Exception ex) { AppLogger.Warning($"Не удалось эвакуировать окно {hwnd}: {ex.Message}"); }
             return true;
         }, IntPtr.Zero);

@@ -8,6 +8,8 @@ internal static class AppPaths
     internal static readonly string ManagedDesktopsFile = Path.Combine(DataDirectory, "managed-desktops.json");
     internal static readonly string SettingsFile = Path.Combine(DataDirectory, "settings.json");
     internal static readonly string LogFile = Path.Combine(DataDirectory, "FullScreenManager.log");
+    internal static readonly string LegacyImportMarker = Path.Combine(DataDirectory, "legacy-import.completed");
+    internal static readonly string DiagnosticsFile = Path.Combine(DataDirectory, "diagnostics.json");
 
     internal static void EnsureCreated() => Directory.CreateDirectory(DataDirectory);
 }

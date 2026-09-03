@@ -15,6 +15,7 @@ internal sealed class ManagedSession
 {
     public long WindowHandle { get; set; }
     public uint ProcessId { get; set; }
+    public DateTime? ProcessStartedUtc { get; set; }
     public string ExecutablePath { get; set; } = "";
     public Guid OriginDesktopId { get; set; }
     public Guid DedicatedDesktopId { get; set; }
@@ -28,10 +29,11 @@ internal sealed class ManagedSession
     [JsonIgnore] public DesktopService.Desktop? Origin { get; set; }
     [JsonIgnore] public DesktopService.Desktop? Dedicated { get; set; }
     [JsonIgnore] public DateTime NextNameSyncUtc { get; set; }
-    [JsonIgnore] public DateTime? DesktopMissingSince { get; set; }
-    [JsonIgnore] public DateTime? OriginMissingSince { get; set; }
     [JsonIgnore] public bool AwaitingFullscreenReactivation { get; set; }
+    [JsonIgnore] public bool ActivationRequested { get; set; }
     [JsonIgnore] public bool WasOnDedicatedDesktop { get; set; }
     [JsonIgnore] public bool WasForeground { get; set; }
+    [JsonIgnore] public int MissingDesktopObservations { get; set; }
+    [JsonIgnore] public int MissingWindowObservations { get; set; }
     [JsonIgnore] public IntPtr Hwnd => new(WindowHandle);
 }

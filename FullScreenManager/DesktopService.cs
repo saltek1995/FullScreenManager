@@ -105,6 +105,12 @@ internal sealed class DesktopService
         catch { return false; }
     }
 
+    public Desktop? GetWindowDesktop(IntPtr hwnd)
+    {
+        try { return Find(_public.GetWindowDesktopId(hwnd)); }
+        catch { return null; }
+    }
+
     public void RemoveById(Guid desktopId, Guid fallbackId)
     {
         var desktop = Find(desktopId)
@@ -115,7 +121,6 @@ internal sealed class DesktopService
             throw new InvalidOperationException("Удаляемый стол не может быть столом возврата.");
         if (IsCurrent(desktop)) Switch(fallback);
         Remove(desktop, fallback);
-        Thread.Sleep(500);
         if (Find(desktopId) is not null)
             throw new InvalidOperationException($"Windows не удалила рабочий стол {desktopId}.");
     }
@@ -162,8 +167,14 @@ internal sealed class DesktopService
             ?? throw new InvalidOperationException("Созданный стол не найден в системной коллекции.");
         service.SetName(found, "FullScreenManager Found Test");
         service.MoveWindow(hwnd, created);
+        if (!service.IsWindowOnDesktop(hwnd, created))
+            throw new InvalidOperationException("Windows не подтвердила перенос тестового окна в Space.");
         service.MoveWindow(hwnd, origin);
+        if (!service.IsWindowOnDesktop(hwnd, origin))
+            throw new InvalidOperationException("Windows не подтвердила возврат тестового окна.");
         service.Remove(created, origin);
+        if (service.Find(created.Id) is not null)
+            throw new InvalidOperationException("Windows не подтвердила удаление тестового Space.");
     }
 
     private static void RemoveTestDesktop(DesktopService service, Desktop? created, Desktop origin)

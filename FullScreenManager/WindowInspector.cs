@@ -19,7 +19,7 @@ internal static class WindowInspector
     internal static bool BelongsToApplication(IntPtr hwnd, ManagedSession session)
     {
         NativeMethods.GetWindowThreadProcessId(hwnd, out var processId);
-        if (processId == session.ProcessId || IsOwnedBy(hwnd, session.Hwnd)) return true;
+        if (IsSameProcessInstance(processId, session) || IsOwnedBy(hwnd, session.Hwnd)) return true;
         var executablePath = GetExecutablePath(processId);
         return !string.IsNullOrWhiteSpace(executablePath) &&
                !string.IsNullOrWhiteSpace(session.ExecutablePath) &&
@@ -36,7 +36,25 @@ internal static class WindowInspector
     {
         if (!NativeMethods.IsWindow(hwnd)) return false;
         NativeMethods.GetWindowThreadProcessId(hwnd, out var processId);
-        return processId == session.ProcessId;
+        return IsSameProcessInstance(processId, session);
+    }
+
+    internal static bool IsSameProcessInstance(uint processId, ManagedSession session)
+    {
+        if (processId != session.ProcessId) return false;
+        if (session.ProcessStartedUtc is null) return true;
+        var started = GetProcessStartedUtc(processId);
+        return started is not null && started.Value == session.ProcessStartedUtc.Value;
+    }
+
+    internal static DateTime? GetProcessStartedUtc(uint processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            return process.StartTime.ToUniversalTime();
+        }
+        catch { return null; }
     }
 
     internal static void Enumerate(Action<IntPtr> visitor)
@@ -91,7 +109,9 @@ internal static class WindowInspector
 
     internal static bool IsCandidate(IntPtr hwnd)
     {
-        if (!NativeMethods.IsWindowVisible(hwnd) || NativeMethods.GetWindowTextLength(hwnd) == 0) return false;
+        // Games can expose an untitled top-level HWND while entering exclusive
+        // fullscreen, so a non-empty caption is not a reliable invariant.
+        if (!NativeMethods.IsWindowVisible(hwnd)) return false;
         const long toolWindow = 0x00000080;
         const long noActivate = 0x08000000;
         var extendedStyle = NativeMethods.GetWindowLongPtr(hwnd, NativeMethods.GwlExStyle).ToInt64();

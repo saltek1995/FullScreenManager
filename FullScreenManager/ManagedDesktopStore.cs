@@ -24,7 +24,7 @@ internal sealed class ManagedDesktopStore
                              File.ReadAllText(AppPaths.ManagedDesktopsFile)) ?? [])
                     _records[record.DesktopId] = record;
             }
-            ImportLegacyLog();
+            ImportLegacyLogOnce();
         }
         catch (Exception ex) { AppLogger.Error("Не удалось загрузить реестр управляемых Space", ex); }
     }
@@ -33,11 +33,18 @@ internal sealed class ManagedDesktopStore
 
     internal void Track(Guid desktopId, Guid fallbackId)
     {
+        var changed = false;
         if (!_records.TryGetValue(desktopId, out var record))
+        {
             _records[desktopId] = new ManagedDesktopRecord { DesktopId = desktopId, FallbackId = fallbackId };
-        else if (record.FallbackId == Guid.Empty && fallbackId != Guid.Empty)
+            changed = true;
+        }
+        else if (fallbackId != Guid.Empty && record.FallbackId != fallbackId)
+        {
             record.FallbackId = fallbackId;
-        Save();
+            changed = true;
+        }
+        if (changed) Save();
     }
 
     internal void Forget(Guid desktopId)
@@ -45,14 +52,26 @@ internal sealed class ManagedDesktopStore
         if (_records.Remove(desktopId)) Save();
     }
 
-    private void ImportLegacyLog()
+    internal void ForgetMany(IEnumerable<Guid> desktopIds)
     {
-        if (!File.Exists(AppPaths.LogFile)) return;
-        foreach (Match match in Regex.Matches(File.ReadAllText(AppPaths.LogFile),
-                     @"Создана сессия\s+([0-9a-fA-F-]{36})"))
-            if (Guid.TryParse(match.Groups[1].Value, out var id) && !_records.ContainsKey(id))
-                _records[id] = new ManagedDesktopRecord { DesktopId = id };
-        Save();
+        var changed = false;
+        foreach (var desktopId in desktopIds) changed |= _records.Remove(desktopId);
+        if (changed) Save();
+    }
+
+    private void ImportLegacyLogOnce()
+    {
+        if (File.Exists(AppPaths.LegacyImportMarker)) return;
+        if (File.Exists(AppPaths.LogFile))
+        {
+            foreach (Match match in Regex.Matches(File.ReadAllText(AppPaths.LogFile),
+                         @"Создана сессия\s+([0-9a-fA-F-]{36})"))
+                if (Guid.TryParse(match.Groups[1].Value, out var id) && !_records.ContainsKey(id))
+                    _records[id] = new ManagedDesktopRecord { DesktopId = id };
+            Save();
+        }
+        AppPaths.EnsureCreated();
+        File.WriteAllText(AppPaths.LegacyImportMarker, DateTimeOffset.UtcNow.ToString("O"));
     }
 
     private void Save()

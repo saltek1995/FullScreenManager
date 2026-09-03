@@ -5,122 +5,65 @@ internal static class SessionRecovery
     internal static IReadOnlyList<ManagedSession> Recover(
         DesktopService desktops, SessionStore sessionStore, ManagedDesktopStore desktopStore)
     {
-        var sessions = sessionStore.Load();
-        foreach (var session in sessions)
+        var loaded = sessionStore.Load().OrderByDescending(session => session.UpdatedUtc).ToList();
+        foreach (var session in loaded)
             desktopStore.Track(session.DedicatedDesktopId, session.OriginDesktopId);
-        CleanupOrphanedDesktops(desktops, desktopStore, sessions);
 
-        var managedIds = sessions.Select(item => item.DedicatedDesktopId).ToHashSet();
-        var sessionsByDesktop = sessions.GroupBy(item => item.DedicatedDesktopId)
-            .ToDictionary(group => group.Key, group => group.First());
+        var selected = SelectUniqueSessions(loaded);
+        var managedIds = loaded.Select(session => session.DedicatedDesktopId).ToHashSet();
         var safeOrigin = desktops.GetAll().FirstOrDefault(desktop => !managedIds.Contains(desktop.Id));
-        if (sessions.Count > 0 && safeOrigin is null) safeOrigin = CreateRescueDesktop(desktops);
 
-        foreach (var session in sessions)
-            RestoreSession(desktops, session, sessions, sessionsByDesktop, safeOrigin);
-        return sessions;
+        foreach (var session in selected)
+            RestoreSession(desktops, session, safeOrigin, managedIds);
+        return selected;
     }
 
-    internal static DesktopService.Desktop ResolveOrigin(
-        DesktopService desktops, ManagedSession session, DesktopService.Desktop dedicated)
+    private static IReadOnlyList<ManagedSession> SelectUniqueSessions(IEnumerable<ManagedSession> sessions)
     {
-        var origin = desktops.Find(session.OriginDesktopId);
-        if (origin is not null && origin.Id != dedicated.Id) return origin;
-        var current = desktops.Current();
-        if (current.Id != dedicated.Id) return current;
-        AppLogger.Warning($"Исходный стол сессии {dedicated.Id} исчез; создан безопасный стол возврата");
-        return CreateRescueDesktop(desktops);
+        var handles = new HashSet<long>();
+        var desktops = new HashSet<Guid>();
+        var result = new List<ManagedSession>();
+        foreach (var session in sessions)
+        {
+            if (!handles.Add(session.WindowHandle) || !desktops.Add(session.DedicatedDesktopId))
+            {
+                AppLogger.Warning($"Отброшена дублирующая сохранённая сессия HWND {session.Hwnd}, Space {session.DedicatedDesktopId}");
+                continue;
+            }
+            result.Add(session);
+        }
+        return result;
     }
 
     private static void RestoreSession(DesktopService desktops, ManagedSession session,
-        IReadOnlyList<ManagedSession> allSessions,
-        IReadOnlyDictionary<Guid, ManagedSession> sessionsByDesktop,
-        DesktopService.Desktop? safeOrigin)
+        DesktopService.Desktop? safeOrigin, IReadOnlySet<Guid> managedIds)
     {
-        var dedicated = desktops.Find(session.DedicatedDesktopId);
-        if (dedicated is null)
-        {
-            AppLogger.Warning($"Рабочий стол сессии {session.DedicatedDesktopId} уже отсутствует");
-            return;
-        }
-
-        session.Dedicated = dedicated;
+        session.Dedicated = desktops.Find(session.DedicatedDesktopId);
         var storedOrigin = desktops.Find(session.OriginDesktopId);
-        session.Origin = IsValidOrigin(session, dedicated, storedOrigin, sessionsByDesktop)
+        session.Origin = storedOrigin is not null &&
+                         storedOrigin.Id != session.DedicatedDesktopId &&
+                         !managedIds.Contains(storedOrigin.Id)
             ? storedOrigin
-            : safeOrigin ?? ResolveOrigin(desktops, session, dedicated);
-        session.OriginDesktopId = session.Origin!.Id;
-        var ownerIntact = WindowInspector.IsSessionOwnerWindow(session.Hwnd, session) &&
-                          WindowInspector.IsFullscreen(session.Hwnd);
-        session.State = session.State == SessionState.Active && ownerIntact
+            : safeOrigin;
+        if (session.Origin is not null) session.OriginDesktopId = session.Origin.Id;
+
+        var ownerDesktop = desktops.GetWindowDesktop(session.Hwnd);
+        var ownerOnSpace = session.Dedicated is not null &&
+                           WindowInspector.IsSessionOwnerWindow(session.Hwnd, session) &&
+                           (ownerDesktop is null || ownerDesktop.Id == session.Dedicated.Id);
+        if (ownerOnSpace && session.ProcessStartedUtc is null)
+            session.ProcessStartedUtc = WindowInspector.GetProcessStartedUtc(session.ProcessId);
+        var fullscreen = ownerOnSpace && WindowInspector.IsFullscreen(session.Hwnd);
+        var recoverableExclusiveWindow = ownerOnSpace && NativeMethods.IsIconic(session.Hwnd) &&
+                                         !desktops.IsCurrent(session.Dedicated!);
+        session.State = fullscreen || recoverableExclusiveWindow
             ? SessionState.Active
             : SessionState.RetryRequired;
-        var parent = allSessions.FirstOrDefault(item => item.DedicatedDesktopId == session.OriginDesktopId);
-        if (parent is not null && WindowInspector.IsSameApplication(session, parent))
-            session.State = SessionState.RetryRequired;
-        if (session.State == SessionState.RetryRequired) session.NextRetryUtc = DateTime.UtcNow;
+        session.NextRetryUtc = DateTime.UtcNow;
+        session.AwaitingFullscreenReactivation = recoverableExclusiveWindow;
+        session.ActivationRequested = false;
+        session.MissingDesktopObservations = 0;
+        session.MissingWindowObservations = 0;
         session.UpdatedUtc = DateTime.UtcNow;
-    }
-
-    private static bool IsValidOrigin(ManagedSession session, DesktopService.Desktop dedicated,
-        DesktopService.Desktop? origin, IReadOnlyDictionary<Guid, ManagedSession> sessionsByDesktop) =>
-        origin is not null && origin.Id != dedicated.Id && IsAcyclicOrigin(session, origin.Id, sessionsByDesktop);
-
-    private static bool IsAcyclicOrigin(ManagedSession session, Guid originId,
-        IReadOnlyDictionary<Guid, ManagedSession> sessionsByDesktop)
-    {
-        var visited = new HashSet<Guid>();
-        var current = originId;
-        while (sessionsByDesktop.TryGetValue(current, out var parent))
-        {
-            if (current == session.DedicatedDesktopId || !visited.Add(current)) return false;
-            current = parent.OriginDesktopId;
-        }
-        return current != session.DedicatedDesktopId;
-    }
-
-    private static void CleanupOrphanedDesktops(DesktopService desktops, ManagedDesktopStore store,
-        IReadOnlyList<ManagedSession> sessions)
-    {
-        var referenced = sessions.Select(session => session.DedicatedDesktopId).ToHashSet();
-        var records = store.Records;
-        var trackedIds = records.Select(record => record.DesktopId).ToHashSet();
-        var safeFallback = desktops.GetAll().FirstOrDefault(desktop => !trackedIds.Contains(desktop.Id));
-        if (safeFallback is null && records.Any(record => !referenced.Contains(record.DesktopId)))
-            safeFallback = CreateRescueDesktop(desktops);
-
-        foreach (var record in records.Where(record => !referenced.Contains(record.DesktopId)))
-            CleanupOrphan(desktops, store, record, trackedIds, safeFallback);
-    }
-
-    private static void CleanupOrphan(DesktopService desktops, ManagedDesktopStore store,
-        ManagedDesktopRecord record, HashSet<Guid> trackedIds, DesktopService.Desktop? safeFallback)
-    {
-        var desktop = desktops.Find(record.DesktopId);
-        if (desktop is null) { store.Forget(record.DesktopId); return; }
-        var fallback = desktops.Find(record.FallbackId);
-        if (fallback is null || fallback.Id == desktop.Id || trackedIds.Contains(fallback.Id)) fallback = safeFallback;
-        if (fallback is null || fallback.Id == desktop.Id)
-        {
-            AppLogger.Warning($"Для осиротевшего Space {desktop.Id} не найден безопасный стол возврата");
-            return;
-        }
-        try
-        {
-            if (desktops.IsCurrent(desktop)) desktops.Switch(fallback);
-            desktops.Remove(desktop, fallback);
-            if (desktops.Find(desktop.Id) is not null) return;
-            store.Forget(desktop.Id);
-            AppLogger.Info($"Удалён осиротевший Space {desktop.Id}");
-        }
-        catch (Exception ex) { AppLogger.Error($"Не удалось удалить осиротевший Space {desktop.Id}", ex); }
-    }
-
-    private static DesktopService.Desktop CreateRescueDesktop(DesktopService desktops)
-    {
-        var desktop = desktops.Create();
-        try { desktops.SetName(desktop, "Рабочий стол"); }
-        catch (Exception ex) { AppLogger.Warning($"Не удалось назвать резервный стол: {ex.Message}"); }
-        return desktop;
     }
 }

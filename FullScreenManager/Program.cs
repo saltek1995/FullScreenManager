@@ -9,7 +9,10 @@ internal static class Program
     {
         ApplicationConfiguration.Initialize();
         if (IsRemoveCommand(args)) return RemoveDesktop(args);
+        if (args.Contains("--diagnose", StringComparer.OrdinalIgnoreCase)) return RunDiagnostics();
+        if (args.Contains("--self-test-window", StringComparer.OrdinalIgnoreCase)) return RunTestWindow();
         if (args.Contains("--self-test-ui", StringComparer.OrdinalIgnoreCase)) return RunUiSelfTest();
+        if (args.Contains("--self-test-state", StringComparer.OrdinalIgnoreCase)) return RunStateSelfTest();
         if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase)) return RunSelfTest(args);
 
         using var mutex = new Mutex(true, "Local\\FullScreenManager.Singleton", out var firstInstance);
@@ -25,6 +28,37 @@ internal static class Program
     {
         try { AboutDialog.RunLayoutSelfTest(); return 0; }
         catch (Exception ex) { WriteFailure("FullScreenManager-ui-selftest.log", ex); return 4; }
+    }
+
+    private static int RunStateSelfTest()
+    {
+        try { StatePolicy.RunSelfTest(); return 0; }
+        catch (Exception ex) { WriteFailure("FullScreenManager-state-selftest.log", ex); return 5; }
+    }
+
+    private static int RunDiagnostics()
+    {
+        try { Diagnostics.WriteSnapshot(); return 0; }
+        catch (Exception ex) { WriteFailure("FullScreenManager-diagnostics.log", ex); return 6; }
+    }
+
+    private static int RunTestWindow()
+    {
+        using var form = new Form
+        {
+            Text = "FullScreenManager Lifecycle Test",
+            WindowState = FormWindowState.Maximized,
+            ShowInTaskbar = true
+        };
+        using var minimizeTimer = new System.Windows.Forms.Timer { Interval = 4000 };
+        minimizeTimer.Tick += (_, _) =>
+        {
+            minimizeTimer.Stop();
+            form.WindowState = FormWindowState.Minimized;
+        };
+        form.Shown += (_, _) => minimizeTimer.Start();
+        Application.Run(form);
+        return 0;
     }
 
     private static int RemoveDesktop(string[] args)

@@ -5,6 +5,9 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
     <ApplicationIcon>Assets\FullScreenManager.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>FullScreenManager</AssemblyName>
@@ -12,6 +15,6 @@
     <Product>FullScreenManager</Product>
     <Description>macOS-style fullscreen virtual desktops for Windows</Description>
     <Company>FullScreenManager</Company>
-    <Version>1.0.43</Version>
+    <Version>1.0.44</Version>
   </PropertyGroup>
 </Project>
