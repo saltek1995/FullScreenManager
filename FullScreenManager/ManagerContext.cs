@@ -308,7 +308,9 @@ internal sealed class ManagerContext : ApplicationContext
 
         if (visible)
         {
-            WindowMover.Reconcile(_desktops, session);
+            var evacuatedForeground = WindowMover.Reconcile(_desktops, session);
+            if (evacuatedForeground != IntPtr.Zero)
+                FollowEvacuatedWindow(session, evacuatedForeground);
             UpdateDesktopName(hwnd, session);
         }
         if (fullscreen)
@@ -317,6 +319,23 @@ internal sealed class ManagerContext : ApplicationContext
             session.ActivationRequested = false;
         }
         RememberWindowPosition(session, current, foreground);
+    }
+
+    private void FollowEvacuatedWindow(ManagedSession session, IntPtr hwnd)
+    {
+        try
+        {
+            if (session.Origin is null || !NativeMethods.IsWindow(hwnd)) return;
+            _desktops.Switch(session.Origin);
+            if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindowAsync(hwnd, 9);
+            if (!NativeMethods.SetForegroundWindow(hwnd))
+                AppLogger.Warning($"Окно {hwnd} перенесено, но Windows отклонила запрос активации.");
+            AppLogger.Info($"Пользователь переведён вслед за окном {hwnd} из Space {session.DedicatedDesktopId}");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"Не удалось перейти вслед за окном {hwnd} из Space {session.DedicatedDesktopId}", ex);
+        }
     }
 
     private static void RememberWindowPosition(ManagedSession session, bool current, bool foreground)

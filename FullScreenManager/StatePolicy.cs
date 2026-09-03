@@ -27,6 +27,9 @@ internal static class StatePolicy
         bool initialDiscovery, bool foreground, bool retryReady) =>
         fullscreen && !suppressed && !managed && retryReady && (initialDiscovery || foreground);
 
+    internal static bool ShouldFollowEvacuatedWindow(bool wasForeground, bool sourceDesktopWasCurrent) =>
+        wasForeground && sourceDesktopWasCurrent;
+
     internal static SessionObservationAction Decide(WindowObservation value)
     {
         if (!value.Exists)
@@ -64,6 +67,13 @@ internal static class StatePolicy
             "A previously missed fullscreen window must be discovered when it becomes foreground.");
         Assert(!ShouldDiscover(true, true, false, true, true, true),
             "Suppressed auxiliary windows must not create sessions.");
+
+        Assert(ShouldFollowEvacuatedWindow(true, true),
+            "A foreground window launched on the active game Space must follow the user to its origin.");
+        Assert(!ShouldFollowEvacuatedWindow(false, true),
+            "A background window must be evacuated without stealing the user from the game.");
+        Assert(!ShouldFollowEvacuatedWindow(true, false),
+            "A window on an inactive Space must not switch the user's desktop.");
 
         Assert(Decide(Observation(iconic: true, current: true)) == SessionObservationAction.Cleanup,
             "A deliberate minimize on the dedicated Space must clean it up.");

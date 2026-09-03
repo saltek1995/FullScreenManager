@@ -8,6 +8,9 @@ var tests = new (string Name, Action Run)[]
     ("suppressed auxiliary is ignored", () => AssertDiscovery(initial: true, foreground: true, expected: false, suppressed: true)),
     ("managed HWND is ignored", () => AssertDiscovery(initial: true, foreground: true, expected: false, managed: true)),
     ("retry backoff is respected", () => AssertDiscovery(initial: true, foreground: true, expected: false, retryReady: false)),
+    ("foreground launch follows user", () => AssertFollow(wasForeground: true, sourceCurrent: true, expected: true)),
+    ("background launch does not steal focus", () => AssertFollow(wasForeground: false, sourceCurrent: true, expected: false)),
+    ("inactive managed Space does not steal focus", () => AssertFollow(wasForeground: true, sourceCurrent: false, expected: false)),
     ("current minimized owner is cleaned", () => AssertAction(Observation(iconic: true, current: true), SessionObservationAction.Cleanup)),
     ("exclusive transition minimize is retained", () => AssertAction(Observation(iconic: true, current: true, awaiting: true), SessionObservationAction.Keep)),
     ("background exclusive minimize is retained", () => AssertAction(Observation(iconic: true), SessionObservationAction.Keep)),
@@ -49,6 +52,12 @@ static void AssertDiscovery(bool initial, bool foreground, bool expected,
 static void AssertAction(WindowObservation observation, SessionObservationAction expected)
 {
     var actual = StatePolicy.Decide(observation);
+    if (actual != expected) throw new InvalidOperationException($"Expected {expected}, got {actual}.");
+}
+
+static void AssertFollow(bool wasForeground, bool sourceCurrent, bool expected)
+{
+    var actual = StatePolicy.ShouldFollowEvacuatedWindow(wasForeground, sourceCurrent);
     if (actual != expected) throw new InvalidOperationException($"Expected {expected}, got {actual}.");
 }
 
