@@ -17,7 +17,6 @@ internal sealed class ManagerContext : ApplicationContext
     private readonly ManagedDesktopStore _desktopStore = new();
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _enabledItem;
-    private bool _initialDiscovery = true;
     private bool _busy;
     private bool _enabled = true;
     private long _scanNumber;
@@ -26,11 +25,7 @@ internal sealed class ManagerContext : ApplicationContext
     {
         RecoverSessions();
         (_tray, _enabledItem) = TrayUi.Create(ExitThread);
-        _enabledItem.CheckedChanged += (_, _) =>
-        {
-            _enabled = _enabledItem.Checked;
-            if (_enabled) _initialDiscovery = true;
-        };
+        _enabledItem.CheckedChanged += (_, _) => _enabled = _enabledItem.Checked;
         _timer.Tick += Tick;
         _timer.Start();
     }
@@ -55,7 +50,6 @@ internal sealed class ManagerContext : ApplicationContext
         MonitorSessions();
         ReconcileTrackedDesktops();
         if (_enabled) DiscoverFullscreenWindows();
-        _initialDiscovery = false;
     }
 
     private void ReconnectDesktopService()
@@ -77,6 +71,10 @@ internal sealed class ManagerContext : ApplicationContext
 
     private void DiscoverFullscreenWindows()
     {
+        _suppressedWindows.RemoveWhere(hwnd => !NativeMethods.IsWindow(hwnd));
+        foreach (var stale in _discoveryRetryScan.Keys.Where(hwnd => !NativeMethods.IsWindow(hwnd)).ToList())
+            _discoveryRetryScan.Remove(stale);
+
         var foreground = NativeMethods.GetForegroundWindow();
         var candidates = new List<WindowCandidate>();
         Enumerate(hwnd =>
@@ -88,13 +86,12 @@ internal sealed class ManagerContext : ApplicationContext
                 _discoveryRetryScan.Remove(hwnd);
                 return;
             }
-            var suppressed = _suppressedWindows.Contains(hwnd);
             var managed = IsAlreadyManaged(hwnd);
             var retryReady = !_discoveryRetryScan.TryGetValue(hwnd, out var retryAt) || _scanNumber >= retryAt;
-            if (!StatePolicy.ShouldDiscover(fullscreen, suppressed, managed,
-                    _initialDiscovery, hwnd == foreground, retryReady)) return;
+            if (!StatePolicy.ShouldDiscover(fullscreen, managed, retryReady)) return;
             var origin = _desktops.GetWindowDesktop(hwnd);
-            if (origin is not null) candidates.Add(new WindowCandidate(hwnd, origin, hwnd == foreground));
+            if (origin is not null)
+                candidates.Add(new WindowCandidate(hwnd, origin, RepresentsForegroundWindow(hwnd, foreground)));
         });
 
         // Move the foreground window last, then activate only its resulting Space.
@@ -110,11 +107,14 @@ internal sealed class ManagerContext : ApplicationContext
         var host = FindSessionByDesktop(candidate.Origin.Id);
         if (host is not null && BelongsToApplication(candidate.Handle, host))
         {
-            _suppressedWindows.Add(candidate.Handle);
-            AppLogger.Info($"Вспомогательное полноэкранное окно {candidate.Handle} оставлено в Space {host.DedicatedDesktopId}");
+            if (_suppressedWindows.Add(candidate.Handle))
+                AppLogger.Info($"Вспомогательное полноэкранное окно {candidate.Handle} оставлено в Space {host.DedicatedDesktopId}");
             return;
         }
 
+        // Suppression is valid only while the window is an auxiliary view of the
+        // session currently owning this desktop. HWND values are reusable.
+        _suppressedWindows.Remove(candidate.Handle);
         TryCreateSession(candidate);
     }
 
@@ -134,9 +134,10 @@ internal sealed class ManagerContext : ApplicationContext
             NativeMethods.GetWindowThreadProcessId(candidate.Handle, out var processId);
             var name = GetApplicationName(candidate.Handle);
             session = RegisterSession(candidate.Handle, processId, origin, dedicated, name);
-            session.NextNameSyncUtc = TrySetDesktopName(dedicated, name)
-                ? DateTime.MaxValue
-                : DateTime.UtcNow.AddSeconds(5);
+            if (TrySetDesktopName(dedicated, name))
+                session.NextNameSyncScan = long.MaxValue;
+            else
+                ScheduleNameSyncRetry(session);
 
             _desktops.MoveWindow(candidate.Handle, dedicated);
             if (!_desktops.IsWindowOnDesktop(candidate.Handle, dedicated))
@@ -618,22 +619,30 @@ internal sealed class ManagerContext : ApplicationContext
     {
         var currentName = GetApplicationName(hwnd);
         var nameChanged = !string.Equals(currentName, session.Name, StringComparison.Ordinal);
-        if (!nameChanged && (session.NextNameSyncUtc == DateTime.MaxValue ||
-                             DateTime.UtcNow < session.NextNameSyncUtc)) return;
+        if (!nameChanged && (session.NextNameSyncScan == long.MaxValue ||
+                             _scanNumber < session.NextNameSyncScan)) return;
         try
         {
             if (session.Dedicated is null) return;
             _desktops.SetName(session.Dedicated, currentName);
             session.Name = currentName;
-            session.NextNameSyncUtc = DateTime.MaxValue;
+            session.NextNameSyncScan = long.MaxValue;
+            session.NameSyncRetryCount = 0;
             session.UpdatedUtc = DateTime.UtcNow;
             SaveSessions();
         }
         catch (Exception ex)
         {
-            session.NextNameSyncUtc = DateTime.UtcNow.AddSeconds(5);
+            ScheduleNameSyncRetry(session);
             AppLogger.Error($"Не удалось синхронизировать имя Space {session.DedicatedDesktopId}", ex);
         }
+    }
+
+    private void ScheduleNameSyncRetry(ManagedSession session)
+    {
+        session.NameSyncRetryCount++;
+        var backoffScans = 1L << Math.Min(session.NameSyncRetryCount - 1, 7);
+        session.NextNameSyncScan = _scanNumber + backoffScans;
     }
 
     private void ScheduleRetry(ManagedSession session, Exception exception)

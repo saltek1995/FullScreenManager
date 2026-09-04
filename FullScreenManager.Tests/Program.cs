@@ -2,12 +2,14 @@ using FullScreenManager;
 
 var tests = new (string Name, Action Run)[]
 {
-    ("startup discovers background fullscreen", () => AssertDiscovery(initial: true, foreground: false, expected: true)),
-    ("runtime ignores background fullscreen", () => AssertDiscovery(initial: false, foreground: false, expected: false)),
-    ("runtime recovers missed foreground fullscreen", () => AssertDiscovery(initial: false, foreground: true, expected: true)),
-    ("suppressed auxiliary is ignored", () => AssertDiscovery(initial: true, foreground: true, expected: false, suppressed: true)),
-    ("managed HWND is ignored", () => AssertDiscovery(initial: true, foreground: true, expected: false, managed: true)),
-    ("retry backoff is respected", () => AssertDiscovery(initial: true, foreground: true, expected: false, retryReady: false)),
+    ("startup discovers background fullscreen", () => AssertDiscovery(expected: true)),
+    ("runtime discovers background fullscreen", () => AssertDiscovery(expected: true)),
+    ("non-fullscreen is ignored", () => AssertDiscovery(expected: false, fullscreen: false)),
+    ("managed HWND is ignored", () => AssertDiscovery(expected: false, managed: true)),
+    ("retry backoff is respected", () => AssertDiscovery(expected: false, retryReady: false)),
+    ("exact monitor bounds are fullscreen", AssertExactMonitorCoverage),
+    ("oversized exclusive bounds are fullscreen", AssertOversizedMonitorCoverage),
+    ("partial monitor bounds are not fullscreen", AssertPartialMonitorCoverage),
     ("foreground launch follows user", () => AssertFollow(wasForeground: true, sourceCurrent: true, expected: true)),
     ("background launch does not steal focus", () => AssertFollow(wasForeground: false, sourceCurrent: true, expected: false)),
     ("inactive managed Space does not steal focus", () => AssertFollow(wasForeground: true, sourceCurrent: false, expected: false)),
@@ -42,12 +44,38 @@ foreach (var test in tests)
 Console.WriteLine($"{tests.Length - failed}/{tests.Length} tests passed");
 return failed == 0 ? 0 : 1;
 
-static void AssertDiscovery(bool initial, bool foreground, bool expected,
-    bool suppressed = false, bool managed = false, bool retryReady = true)
+static void AssertDiscovery(bool expected, bool fullscreen = true, bool managed = false, bool retryReady = true)
 {
-    var actual = StatePolicy.ShouldDiscover(true, suppressed, managed, initial, foreground, retryReady);
+    var actual = StatePolicy.ShouldDiscover(fullscreen, managed, retryReady);
     if (actual != expected) throw new InvalidOperationException($"Expected {expected}, got {actual}.");
 }
+
+static void AssertExactMonitorCoverage()
+{
+    var monitor = Rect(0, 0, 1920, 1080);
+    if (!WindowInspector.CoversMonitor(monitor, monitor))
+        throw new InvalidOperationException("Exact monitor bounds were rejected.");
+}
+
+static void AssertOversizedMonitorCoverage()
+{
+    if (!WindowInspector.CoversMonitor(Rect(-8, -8, 1928, 1088), Rect(0, 0, 1920, 1080)))
+        throw new InvalidOperationException("Oversized exclusive bounds were rejected.");
+}
+
+static void AssertPartialMonitorCoverage()
+{
+    if (WindowInspector.CoversMonitor(Rect(0, 0, 1600, 900), Rect(0, 0, 1920, 1080)))
+        throw new InvalidOperationException("Partial monitor bounds were accepted.");
+}
+
+static NativeMethods.Rect Rect(int left, int top, int right, int bottom) => new()
+{
+    Left = left,
+    Top = top,
+    Right = right,
+    Bottom = bottom
+};
 
 static void AssertAction(WindowObservation observation, SessionObservationAction expected)
 {

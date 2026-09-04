@@ -23,9 +23,8 @@ internal static class StatePolicy
 {
     internal const int MissingConfirmationCount = 3;
 
-    internal static bool ShouldDiscover(bool fullscreen, bool suppressed, bool managed,
-        bool initialDiscovery, bool foreground, bool retryReady) =>
-        fullscreen && !suppressed && !managed && retryReady && (initialDiscovery || foreground);
+    internal static bool ShouldDiscover(bool fullscreen, bool managed, bool retryReady) =>
+        fullscreen && !managed && retryReady;
 
     internal static bool ShouldFollowEvacuatedWindow(bool wasForeground, bool sourceDesktopWasCurrent) =>
         wasForeground && sourceDesktopWasCurrent;
@@ -59,14 +58,16 @@ internal static class StatePolicy
 
     internal static void RunSelfTest()
     {
-        Assert(ShouldDiscover(true, false, false, true, false, true),
+        Assert(ShouldDiscover(true, false, true),
             "Startup discovery must include background fullscreen windows.");
-        Assert(!ShouldDiscover(true, false, false, false, false, true),
-            "Runtime discovery must wait for a background window to become foreground.");
-        Assert(ShouldDiscover(true, false, false, false, true, true),
-            "A previously missed fullscreen window must be discovered when it becomes foreground.");
-        Assert(!ShouldDiscover(true, true, false, true, true, true),
-            "Suppressed auxiliary windows must not create sessions.");
+        Assert(ShouldDiscover(true, false, true),
+            "Runtime discovery must continuously include background fullscreen windows.");
+        Assert(!ShouldDiscover(false, false, true),
+            "A non-fullscreen window must not create a session.");
+        Assert(!ShouldDiscover(true, true, true),
+            "An already managed window must not create another session.");
+        Assert(!ShouldDiscover(true, false, false),
+            "A failed operation must respect its retry backoff.");
 
         Assert(ShouldFollowEvacuatedWindow(true, true),
             "A foreground window launched on the active game Space must follow the user to its origin.");

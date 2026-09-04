@@ -28,7 +28,8 @@ internal sealed class ManagedSession
 
     [JsonIgnore] public DesktopService.Desktop? Origin { get; set; }
     [JsonIgnore] public DesktopService.Desktop? Dedicated { get; set; }
-    [JsonIgnore] public DateTime NextNameSyncUtc { get; set; }
+    [JsonIgnore] public long NextNameSyncScan { get; set; }
+    [JsonIgnore] public int NameSyncRetryCount { get; set; }
     [JsonIgnore] public bool AwaitingFullscreenReactivation { get; set; }
     [JsonIgnore] public bool ActivationRequested { get; set; }
     [JsonIgnore] public bool WasOnDedicatedDesktop { get; set; }

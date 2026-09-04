@@ -70,18 +70,29 @@ internal static class WindowInspector
     {
         if (NativeMethods.IsIconic(hwnd)) return false;
         if (NativeMethods.IsZoomed(hwnd)) return true;
-        if (!TryGetWindowBounds(hwnd, out var window)) return false;
         var monitor = NativeMethods.MonitorFromWindow(hwnd, 2);
         if (monitor == IntPtr.Zero) return false;
         var info = new NativeMethods.MonitorInfo { Size = Marshal.SizeOf<NativeMethods.MonitorInfo>() };
         if (!NativeMethods.GetMonitorInfo(monitor, ref info)) return false;
 
-        const int tolerance = 2;
-        return IsClose(window.Left, info.Monitor.Left, tolerance) &&
-               IsClose(window.Top, info.Monitor.Top, tolerance) &&
-               IsClose(window.Right, info.Monitor.Right, tolerance) &&
-               IsClose(window.Bottom, info.Monitor.Bottom, tolerance);
+        var dwmResult = NativeMethods.DwmGetWindowAttribute(hwnd, NativeMethods.DwmwaExtendedFrameBounds,
+            out NativeMethods.Rect dwmBounds, Marshal.SizeOf<NativeMethods.Rect>());
+        if (dwmResult == 0 && CoversMonitor(dwmBounds, info.Monitor)) return true;
+
+        // Exclusive fullscreen and display-mode changes can leave DWM bounds stale
+        // while User32 already reports coordinates in the game's active resolution.
+        return NativeMethods.GetPhysicalWindowRect(hwnd, out var userBounds) &&
+               CoversMonitor(userBounds, info.Monitor);
     }
+
+    internal static bool CoversMonitor(NativeMethods.Rect window, NativeMethods.Rect monitor, int tolerance = 2) =>
+        window.Left <= monitor.Left + tolerance &&
+        window.Top <= monitor.Top + tolerance &&
+        window.Right >= monitor.Right - tolerance &&
+        window.Bottom >= monitor.Bottom - tolerance;
+
+    internal static bool RepresentsForegroundWindow(IntPtr candidate, IntPtr foreground) =>
+        candidate == foreground || IsOwnedBy(foreground, candidate);
 
     internal static bool IsClearlyWindowed(IntPtr hwnd)
     {
@@ -167,18 +178,6 @@ internal static class WindowInspector
         "Virtual desktop switching preview" or "Desktop switching preview" or
         "Наложение Ножниц" or "Snipping Tool overlay" or "Screen snipping" or
         "Интерфейс ввода Windows" or "Windows Input Experience";
-
-    private static bool IsClose(int first, int second, int tolerance) => Math.Abs(first - second) <= tolerance;
-
-    private static bool TryGetWindowBounds(IntPtr hwnd, out NativeMethods.Rect bounds)
-    {
-        // DWM bounds use physical screen coordinates and avoid GetWindowRect's
-        // DPI virtualization. Exclusive mode can disable DWM, so retain the
-        // User32 call as a required fallback.
-        var result = NativeMethods.DwmGetWindowAttribute(hwnd, NativeMethods.DwmwaExtendedFrameBounds,
-            out bounds, Marshal.SizeOf<NativeMethods.Rect>());
-        return result == 0 || NativeMethods.GetPhysicalWindowRect(hwnd, out bounds);
-    }
 
     private static string SanitizeDesktopName(string value)
     {
