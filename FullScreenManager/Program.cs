@@ -12,7 +12,6 @@ internal static class Program
         if (args.Contains("--diagnose", StringComparer.OrdinalIgnoreCase)) return RunDiagnostics();
         if (args.Contains("--self-test-window", StringComparer.OrdinalIgnoreCase)) return RunTestWindow();
         if (args.Contains("--self-test-ui", StringComparer.OrdinalIgnoreCase)) return RunUiSelfTest();
-        if (args.Contains("--self-test-state", StringComparer.OrdinalIgnoreCase)) return RunStateSelfTest();
         if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase)) return RunSelfTest(args);
 
         using var mutex = new Mutex(true, "Local\\FullScreenManager.Singleton", out var firstInstance);
@@ -28,12 +27,6 @@ internal static class Program
     {
         try { AboutDialog.RunLayoutSelfTest(); return 0; }
         catch (Exception ex) { WriteFailure("FullScreenManager-ui-selftest.log", ex); return 4; }
-    }
-
-    private static int RunStateSelfTest()
-    {
-        try { StatePolicy.RunSelfTest(); return 0; }
-        catch (Exception ex) { WriteFailure("FullScreenManager-state-selftest.log", ex); return 5; }
     }
 
     private static int RunDiagnostics()

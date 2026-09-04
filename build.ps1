@@ -1,13 +1,13 @@
 #requires -Version 5.1
 
 $ErrorActionPreference = 'Stop'
+$solution = Join-Path $PSScriptRoot 'FullScreenManager.sln'
 $project = Join-Path $PSScriptRoot 'FullScreenManager\FullScreenManager.csproj'
-$tests = Join-Path $PSScriptRoot 'FullScreenManager.Tests\FullScreenManager.Tests.csproj'
 $output = Join-Path $PSScriptRoot 'dist'
 $localDotnet = Join-Path $PSScriptRoot '.dotnet\dotnet.exe'
 $dotnet = if (Test-Path -LiteralPath $localDotnet) { $localDotnet } else { 'dotnet' }
 
-& $dotnet run --project $tests --configuration Release
+& $dotnet test $solution --configuration Release
 if ($LASTEXITCODE -ne 0) {
     throw "Regression tests failed with exit code $LASTEXITCODE."
 }
